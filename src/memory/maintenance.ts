@@ -13,7 +13,7 @@ import { extractMemoriesFromMessages, type ExtractedMemory } from "./extract";
 import { persistMemoryWithMerge } from "./merge";
 import type { Env, MemoryMaintenanceQueueMessage, MessageRecord } from "../types";
 
-const EXTRACT_BATCH_SIZE = 50;
+const EXTRACT_BATCH_SIZE = 30;
 
 function getMinImportance(env: Env): number {
   const value = Number(env.MEMORY_MIN_IMPORTANCE || 0.55);
