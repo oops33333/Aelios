@@ -44,7 +44,7 @@ EMBEDDING_MODEL = "workers-ai/@cf/google/embeddinggemma-300m"
 EMBEDDING_DIMENSIONS = "768"
 
 # ─── 记忆提取配置 ───
-ENABLE_INCREMENTAL_MEMORY = "false"
+ENABLE_INCREMENTAL_MEMORY = "true"
 ENABLE_DAILY_MEMORY_DIGEST = "true"
 DAILY_DIGEST_TIME_ZONE = "Asia/Shanghai"
 DAILY_DIGEST_MAX_RUNS = "3"
