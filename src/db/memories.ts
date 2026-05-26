@@ -198,7 +198,7 @@ export async function listMemoriesPage(env: Env, filters: ListMemoryFilters): Pr
   // 过滤状态（sweepy 没有 status 字段，用 tags 模拟）
   let filtered = all;
   if (filters.status === "active") {
-    filtered = all.filter((r) => !r.tags?.includes("deleted") && !r.tags?.includes("superseded"));
+    filtered = all.filter((r) => !r.tags?.includes("deleted") && !r.tags?.includes("superseded") && r.category !== "diary" && r.category !== "daily");
   }
 
   const sliced = filtered.slice(offset, offset + limit + 1);
@@ -324,7 +324,7 @@ export async function searchMemoriesByText(
   const results = (await res.json()) as Array<SweepyRecord & { similarity?: number }>;
 
   return results
-    .filter((r) => !r.tags?.includes("deleted") && !r.tags?.includes("superseded"))
+    .filter((r) => !r.tags?.includes("deleted") && !r.tags?.includes("superseded") && r.category !== "diary" && r.category !== "daily")
     .slice(0, input.limit)
     .map((r) => ({
       ...sweepyToMemoryRecord(r, input.namespace),
