@@ -47,7 +47,7 @@ function getOpenRouterBaseUrl(env: Env): string {
 export function normalizeAiGatewayBaseUrl(env: Env): string {
   const base = env.AI_GATEWAY_BASE_URL;
   if (!base) {
-    throw new Error("Missing AI_GATEWAY_BASE_URL");
+    return "";
   }
 
   return base
