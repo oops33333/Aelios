@@ -63,6 +63,12 @@ export interface Env {
   CACHE_DEFAULT_TTL_SECONDS?: string;
   CACHE_MAX_VALUE_BYTES?: string;
   SUMMARY_MODEL?: string;
+  // sweepy
+  SWEEPY_URL?: string;
+  SWEEPY_AUTH?: string;
+  // OpenRouter
+  OPENROUTER_API_KEY?: string;
+  OPENROUTER_BASE_URL?: string;
 }
 
 export interface MemoryMaintenanceQueueMessage {

@@ -1,20 +1,25 @@
 name = "companion-memory-proxy"
+account_id = "60d6f22af1c7502b6ea16028a3823136"
 main = "src/index.ts"
 compatibility_date = "2026-04-01"
 keep_vars = true
 
 [triggers]
-# Cloudflare cron uses UTC. 20:10 UTC is 04:10 in Singapore/China time.
 crons = ["10 20 * * *"]
 
-[ai]
-binding = "AI"
-
 [vars]
-# Visible model knobs. These are intentionally in wrangler.toml so they show
-# up in Cloudflare Variables and can be changed without touching code.
 PUBLIC_MODEL_NAME = "companion"
+
+# ─── 模型配置（走 OpenRouter）───
+# OpenRouter 格式的模型名称
+# 聊天主模型（$0.435/M input, $0.87/M output）
 CHAT_MODEL = "deepseek/deepseek-v4-pro"
+# 记忆提取/整理用的模型（免费，省钱）
+SUMMARY_MODEL = "deepseek/deepseek-v4-flash:free"
+# 视觉模型
+VISION_MODEL = "google/gemini-2.5-flash-preview"
+
+# ─── 记忆过滤（仍走 Workers AI，免费）───
 MEMORY_FILTER_MODEL = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 MEMORY_FILTER_MAX_CANDIDATES = "12"
 MEMORY_FILTER_MAX_OUTPUT = "4"
@@ -22,39 +27,50 @@ MEMORY_FILTER_MAX_CONTENT_CHARS = "700"
 MEMORY_FILTER_OUTPUT_CHARS = "300"
 MEMORY_FILTER_MAX_TOKENS = "1400"
 MEMORY_FILTER_MIN_SCORE = "0.35"
-SUMMARY_MODEL = "deepseek/deepseek-v4-pro"
-VISION_MODEL = "google-ai-studio/gemini-3-flash-preview"
-MEMORY_BACKEND = "vectorize"
+
+# ─── 记忆后端配置 ───
+# 设为 d1 使搜索路径走 searchMemoriesByText（现已改为调 sweepy）
+MEMORY_BACKEND = "d1"
 MEMORY_MIN_SCORE = "0.35"
 MEMORY_TOP_K = "12"
-VECTORIZE_INDEX_NAME = "memo-kb"
+
+# ─── sweepy 记忆库 ───
+SWEEPY_URL = "https://sweepy.cloud"
+AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/60d6f22af1c7502b6ea16028a3823136/ginna"
+# SWEEPY_AUTH 放在 Cloudflare Dashboard Secrets 里：SET_IN_DASHBOARD
+
+# ─── embedding 由 sweepy 处理，以下仅为兼容保留 ───
 EMBEDDING_MODEL = "workers-ai/@cf/google/embeddinggemma-300m"
 EMBEDDING_DIMENSIONS = "768"
+
+# ─── 记忆提取配置 ───
 ENABLE_INCREMENTAL_MEMORY = "false"
 ENABLE_DAILY_MEMORY_DIGEST = "true"
-DAILY_DIGEST_TIME_ZONE = "Asia/Singapore"
+DAILY_DIGEST_TIME_ZONE = "Asia/Shanghai"
 DAILY_DIGEST_MAX_RUNS = "3"
 DAILY_DIGEST_MAX_TOKENS = "5000"
 ENABLE_DAILY_SUMMARY_MEMORY = "false"
+
+# ─── Anthropic 缓存 ───
 ANTHROPIC_THINKING_ENABLED = "false"
 ANTHROPIC_THINKING_BUDGET = "1024"
 ANTHROPIC_CACHE_ENABLED = "true"
 ANTHROPIC_AUTO_CACHE_ENABLED = "true"
 ANTHROPIC_ROLLING_CACHE_ENABLED = "true"
 ANTHROPIC_CACHE_TTL = "5m"
-# For custom Anthropic-compatible providers whose base_url already ends in /v1,
-# keep this as "messages". If the base_url is only the root domain, use
-# "v1/messages".
 CUSTOM_ANTHROPIC_MESSAGES_PATH = "messages"
 
-# Private/account-specific variables live in the Cloudflare Dashboard:
-# AI_GATEWAY_BASE_URL, CHATBOX_API_KEY, MEMORY_MCP_API_KEY,
-# GUIDE_DOG_API_KEY, CF_AIG_TOKEN.
-# D1 binding is auto-filled by `npm run setup:cloudflare`.
+# ─── Secrets（在 Cloudflare Dashboard 设置，不要写在这里）───
+# OPENROUTER_API_KEY = "sk-or-..."
+# SWEEPY_AUTH = "SET_IN_DASHBOARD"
+# CHATBOX_API_KEY, MEMORY_MCP_API_KEY, GUIDE_DOG_API_KEY
+# AI_GATEWAY_BASE_URL（如果 MEMORY_FILTER_MODEL 需要 Workers AI）
+binding = "AI"
 
-[[vectorize]]
-binding = "VECTORIZE"
-index_name = "memo-kb"
+# ─── Vectorize 已移除，由 sweepy 向量搜索替代 ───
+# [[vectorize]]
+# binding = "VECTORIZE"
+# index_name = "memo-kb"
 
 [[queues.producers]]
 binding = "MEMORY_QUEUE"

@@ -3,7 +3,7 @@ import type { Env } from "../types";
 import { toMemoryApiRecord } from "./search";
 
 export async function buildStableMemoryPack(env: Env, namespace: string): Promise<string> {
-  const records = await listMemories(env.DB, {
+  const records = await listMemories(env, {
     namespace,
     status: "active",
     limit: 100

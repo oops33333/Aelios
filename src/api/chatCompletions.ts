@@ -48,10 +48,10 @@ export function hasToolContent(body: OpenAIChatRequest): boolean {
  * Deterministic sort is applied later by the assembler itself.
  */
 async function fetchPinnedPersonaMemories(
-  db: D1Database,
+  env: Env,
   namespace: string
 ): Promise<MemoryApiRecord[]> {
-  const records = await listMemories(db, {
+  const records = await listMemories(env, {
     namespace,
     status: "active",
     limit: 100,
@@ -120,7 +120,7 @@ export async function handleChatCompletions(
     query: extractLastUserText(body.messages)
   });
 
-  const pinnedPersonaMemories = await fetchPinnedPersonaMemories(env.DB, auth.profile.namespace);
+  const pinnedPersonaMemories = await fetchPinnedPersonaMemories(env, auth.profile.namespace);
   const latestSummary = await getLatestSummary(env.DB, auth.profile.namespace);
   const summaryEntry = latestSummary ? { content: latestSummary.content } : null;
 

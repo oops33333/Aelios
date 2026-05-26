@@ -1,6 +1,85 @@
-import type { MemoryRecord } from "../types";
-import { newId } from "../utils/ids";
+/**
+ * memories.ts — 对接 sweepy.cloud 的记忆适配层
+ *
+ * 原版通过 D1 SQL 读写，现改为 HTTP 调用 sweepy API。
+ * 函数签名从 (db: D1Database, ...) 改为 (env: Env, ...)，
+ * 调用方需将 env.DB 改为 env。
+ */
+
+import type { Env, MemoryRecord } from "../types";
 import { nowIso } from "../utils/time";
+
+// ─── sweepy HTTP helpers ───
+
+function sweepyUrl(env: Env): string {
+  return (env.SWEEPY_URL || "https://sweepy.cloud").replace(/\/+$/, "");
+}
+
+function sweepyHeaders(env: Env): HeadersInit {
+  const auth = env.SWEEPY_AUTH || "";
+  return {
+    "content-type": "application/json",
+    authorization: "Basic " + btoa(auth),
+  };
+}
+
+async function sweepyFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
+  const base = sweepyUrl(env);
+  return fetch(`${base}${path}`, {
+    ...init,
+    headers: { ...sweepyHeaders(env), ...(init?.headers || {}) },
+  });
+}
+
+// ─── sweepy record ↔ MemoryRecord 转换 ───
+
+interface SweepyRecord {
+  id: number;
+  content: string;
+  category: string;
+  tags: string;
+  source: string | null;
+  created_at: string;
+  updated_at: string;
+  image_path: string | null;
+  valence: number;
+  arousal: number;
+  importance: number;
+  activation_count: number;
+  last_active: string | null;
+  resolved: number;
+}
+
+function sweepyToMemoryRecord(s: SweepyRecord, namespace: string): MemoryRecord {
+  const tags = s.tags
+    ? JSON.stringify(s.tags.split(",").map((t: string) => t.trim()).filter(Boolean))
+    : "[]";
+
+  const isPinned = s.tags?.includes("pinned") || s.tags?.includes("必读") ? 1 : 0;
+
+  return {
+    id: String(s.id),
+    namespace,
+    type: s.category || "note",
+    content: s.content,
+    summary: null,
+    importance: s.importance ?? 0.5,
+    confidence: 0.8,
+    status: "active",
+    pinned: isPinned,
+    tags,
+    source: s.source,
+    source_message_ids: "[]",
+    vector_id: `sweepy_${s.id}`,
+    last_recalled_at: s.last_active,
+    recall_count: s.activation_count || 0,
+    created_at: s.created_at,
+    updated_at: s.updated_at,
+    expires_at: null,
+  };
+}
+
+// ─── 公开接口 ───
 
 export interface CreateMemoryInput {
   namespace: string;
@@ -44,230 +123,221 @@ export interface UpdateMemoryInput {
   expiresAt?: string | null;
 }
 
-export async function createMemory(db: D1Database, input: CreateMemoryInput): Promise<MemoryRecord> {
-  const id = newId("mem");
-  const now = nowIso();
-  const vectorId = `mem_${id}`;
-  const record: MemoryRecord = {
-    id,
-    namespace: input.namespace,
-    type: input.type,
+/**
+ * 写入一条记忆到 sweepy
+ */
+export async function createMemory(env: Env, input: CreateMemoryInput): Promise<MemoryRecord> {
+  const tagsArray = input.tags ?? [];
+  if (input.pinned && !tagsArray.includes("pinned")) tagsArray.push("pinned");
+
+  const body = {
     content: input.content,
-    summary: input.summary ?? null,
+    category: input.type || "note",
+    tags: ["aelios", ...tagsArray].join(","),
+    source: input.source || "aelios",
     importance: input.importance ?? 0.5,
-    confidence: input.confidence ?? 0.8,
-    status: input.status ?? "active",
-    pinned: input.pinned ? 1 : 0,
-    tags: JSON.stringify(input.tags ?? []),
-    source: input.source ?? null,
-    source_message_ids: JSON.stringify(input.sourceMessageIds ?? []),
-    vector_id: vectorId,
-    last_recalled_at: null,
-    recall_count: 0,
-    created_at: now,
-    updated_at: now,
-    expires_at: input.expiresAt ?? null
+    valence: 0,
+    arousal: 0.3,
   };
 
-  await db
-    .prepare(
-      `INSERT INTO memories (
-        id, namespace, type, content, summary, importance, confidence, status,
-        pinned, tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      record.id,
-      record.namespace,
-      record.type,
-      record.content,
-      record.summary,
-      record.importance,
-      record.confidence,
-      record.status,
-      record.pinned,
-      record.tags,
-      record.source,
-      record.source_message_ids,
-      record.vector_id,
-      record.created_at,
-      record.updated_at,
-      record.expires_at
-    )
-    .run();
+  const res = await sweepyFetch(env, "/api/memories", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 
-  return record;
+  if (!res.ok) {
+    console.error("sweepy createMemory failed", res.status, await res.text());
+    // 返回一个占位记录，不阻断上游流程
+    const now = nowIso();
+    return {
+      id: `err_${Date.now()}`,
+      namespace: input.namespace,
+      type: input.type,
+      content: input.content,
+      summary: null,
+      importance: input.importance ?? 0.5,
+      confidence: 0.8,
+      status: "active",
+      pinned: input.pinned ? 1 : 0,
+      tags: JSON.stringify(tagsArray),
+      source: input.source ?? null,
+      source_message_ids: "[]",
+      vector_id: null,
+      last_recalled_at: null,
+      recall_count: 0,
+      created_at: now,
+      updated_at: now,
+      expires_at: null,
+    };
+  }
+
+  const created = (await res.json()) as SweepyRecord;
+  return sweepyToMemoryRecord(created, input.namespace);
 }
 
-export async function listMemoriesPage(db: D1Database, filters: ListMemoryFilters): Promise<ListMemoryPage> {
-  let sql = "SELECT * FROM memories WHERE namespace = ?";
-  const binds: unknown[] = [filters.namespace];
+/**
+ * 列出记忆（按 importance 降序）
+ */
+export async function listMemoriesPage(env: Env, filters: ListMemoryFilters): Promise<ListMemoryPage> {
+  let path = "/api/memories?";
+  const params: string[] = [];
 
-  if (filters.type) {
-    sql += " AND type = ?";
-    binds.push(filters.type);
+  if (filters.type) params.push(`keyword=${encodeURIComponent(filters.type)}`);
+
+  const res = await sweepyFetch(env, `/api/memories${params.length ? "?" + params.join("&") : ""}`);
+
+  if (!res.ok) {
+    console.error("sweepy listMemories failed", res.status);
+    return { records: [], hasMore: false, nextOffset: null };
   }
 
-  if (filters.status) {
-    sql += " AND status = ?";
-    binds.push(filters.status);
+  const all = (await res.json()) as SweepyRecord[];
+  const offset = Math.max(filters.offset ?? 0, 0);
+  const limit = Math.max(filters.limit, 1);
+
+  // 过滤状态（sweepy 没有 status 字段，用 tags 模拟）
+  let filtered = all;
+  if (filters.status === "active") {
+    filtered = all.filter((r) => !r.tags?.includes("deleted") && !r.tags?.includes("superseded"));
   }
 
-  const offset = Math.max(Math.floor(filters.offset ?? 0), 0);
-  const limit = Math.max(Math.floor(filters.limit), 1);
-  sql += " ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ? OFFSET ?";
-  binds.push(limit + 1, offset);
-
-  const result = await db
-    .prepare(sql)
-    .bind(...binds)
-    .all<MemoryRecord>();
-
-  const rows = result.results ?? [];
-  const records = rows.slice(0, limit);
+  const sliced = filtered.slice(offset, offset + limit + 1);
+  const records = sliced.slice(0, limit).map((r) => sweepyToMemoryRecord(r, filters.namespace));
 
   return {
     records,
-    hasMore: rows.length > limit,
-    nextOffset: rows.length > limit ? offset + records.length : null
+    hasMore: sliced.length > limit,
+    nextOffset: sliced.length > limit ? offset + limit : null,
   };
 }
 
-export async function listMemories(db: D1Database, filters: ListMemoryFilters): Promise<MemoryRecord[]> {
-  const page = await listMemoriesPage(db, filters);
+export async function listMemories(env: Env, filters: ListMemoryFilters): Promise<MemoryRecord[]> {
+  const page = await listMemoriesPage(env, filters);
   return page.records;
 }
 
+/**
+ * 按 ID 读取单条记忆
+ */
 export async function getMemoryById(
-  db: D1Database,
+  env: Env,
   input: { namespace: string; id: string }
 ): Promise<MemoryRecord | null> {
-  const record = await db
-    .prepare("SELECT * FROM memories WHERE namespace = ? AND id = ?")
-    .bind(input.namespace, input.id)
-    .first<MemoryRecord>();
+  const res = await sweepyFetch(env, `/api/memories/${input.id}`);
+  if (!res.ok) return null;
 
-  return record ?? null;
+  const record = (await res.json()) as SweepyRecord;
+  return sweepyToMemoryRecord(record, input.namespace);
 }
 
+/**
+ * 批量按 ID 读取
+ */
 export async function fetchMemoriesByIds(
-  db: D1Database,
+  env: Env,
   input: { namespace: string; ids: string[] }
 ): Promise<MemoryRecord[]> {
   if (input.ids.length === 0) return [];
 
-  const placeholders = input.ids.map(() => "?").join(", ");
-  const result = await db
-    .prepare(`SELECT * FROM memories WHERE namespace = ? AND id IN (${placeholders})`)
-    .bind(input.namespace, ...input.ids)
-    .all<MemoryRecord>();
+  // sweepy 没有批量读取接口，逐条读取
+  const results = await Promise.allSettled(
+    input.ids.map((id) => getMemoryById(env, { namespace: input.namespace, id }))
+  );
 
-  return result.results ?? [];
+  return results
+    .filter((r): r is PromiseFulfilledResult<MemoryRecord | null> => r.status === "fulfilled")
+    .map((r) => r.value)
+    .filter((r): r is MemoryRecord => r !== null);
 }
 
+/**
+ * 更新记忆
+ */
 export async function updateMemory(
-  db: D1Database,
+  env: Env,
   input: { namespace: string; id: string; patch: UpdateMemoryInput }
 ): Promise<MemoryRecord | null> {
-  const assignments: string[] = [];
-  const binds: unknown[] = [];
+  const body: Record<string, unknown> = {};
 
-  function set(column: string, value: unknown): void {
-    assignments.push(`${column} = ?`);
-    binds.push(value);
+  if (input.patch.content !== undefined) body.content = input.patch.content;
+  if (input.patch.type !== undefined) body.category = input.patch.type;
+  if (input.patch.importance !== undefined) body.importance = input.patch.importance;
+  if (input.patch.tags !== undefined) body.tags = input.patch.tags.join(",");
+  if (input.patch.status !== undefined) {
+    // sweepy 没有 status 字段，用 tags 标记
+    const currentTags = typeof body.tags === "string" ? body.tags : "";
+    if (input.patch.status === "deleted" || input.patch.status === "superseded") {
+      body.tags = currentTags ? `${currentTags},${input.patch.status}` : input.patch.status;
+    }
   }
 
-  if (input.patch.type !== undefined) set("type", input.patch.type);
-  if (input.patch.content !== undefined) set("content", input.patch.content);
-  if (input.patch.summary !== undefined) set("summary", input.patch.summary);
-  if (input.patch.importance !== undefined) set("importance", input.patch.importance);
-  if (input.patch.confidence !== undefined) set("confidence", input.patch.confidence);
-  if (input.patch.status !== undefined) set("status", input.patch.status);
-  if (input.patch.pinned !== undefined) set("pinned", input.patch.pinned ? 1 : 0);
-  if (input.patch.tags !== undefined) set("tags", JSON.stringify(input.patch.tags));
-  if (input.patch.sourceMessageIds !== undefined) set("source_message_ids", JSON.stringify(input.patch.sourceMessageIds));
-  if (input.patch.expiresAt !== undefined) set("expires_at", input.patch.expiresAt);
-
-  if (assignments.length === 0) {
-    return getMemoryById(db, input);
+  if (Object.keys(body).length === 0) {
+    return getMemoryById(env, input);
   }
 
-  set("updated_at", nowIso());
+  const res = await sweepyFetch(env, `/api/memories/${input.id}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
 
-  await db
-    .prepare(`UPDATE memories SET ${assignments.join(", ")} WHERE namespace = ? AND id = ?`)
-    .bind(...binds, input.namespace, input.id)
-    .run();
+  if (!res.ok) {
+    console.error("sweepy updateMemory failed", res.status, await res.text());
+    return getMemoryById(env, input);
+  }
 
-  return getMemoryById(db, input);
+  const updated = (await res.json()) as SweepyRecord;
+  return sweepyToMemoryRecord(updated, input.namespace);
 }
 
+/**
+ * 软删除
+ */
 export async function softDeleteMemory(
-  db: D1Database,
+  env: Env,
   input: { namespace: string; id: string }
 ): Promise<MemoryRecord | null> {
-  return updateMemory(db, {
+  return updateMemory(env, {
     namespace: input.namespace,
     id: input.id,
-    patch: {
-      status: "deleted"
-    }
+    patch: { status: "deleted" },
   });
 }
 
+/**
+ * 文本搜索记忆 — 调用 sweepy 的语义向量搜索
+ */
 export async function searchMemoriesByText(
-  db: D1Database,
+  env: Env,
   input: { namespace: string; query: string; types?: string[]; limit: number }
 ): Promise<Array<MemoryRecord & { score: number }>> {
-  const query = input.query.trim().replace(/\s+/g, " ").slice(0, 500);
-  const like = `%${query.replace(/[\\%_]/g, "\\$&")}%`;
-  let sql = "SELECT * FROM memories WHERE namespace = ? AND status = 'active'";
-  const binds: unknown[] = [input.namespace];
+  const query = input.query.trim().slice(0, 500);
+  if (!query) return [];
 
-  if (query) {
-    sql += " AND (content LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\' OR type LIKE ? ESCAPE '\\')";
-    binds.push(like, like, like, like);
-  }
+  const encodedQuery = encodeURIComponent(query);
+  const res = await sweepyFetch(env, `/api/memories/search?q=${encodedQuery}`);
 
-  if (input.types && input.types.length > 0) {
-    sql += ` AND type IN (${input.types.map(() => "?").join(", ")})`;
-    binds.push(...input.types);
-  }
-
-  sql += " ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?";
-  binds.push(input.limit);
-
-  let result: D1Result<MemoryRecord>;
-  try {
-    result = await db
-      .prepare(sql)
-      .bind(...binds)
-      .all<MemoryRecord>();
-  } catch (error) {
-    console.error("text memory search failed", error);
+  if (!res.ok) {
+    console.error("sweepy search failed", res.status);
     return [];
   }
 
-  const lowered = query.toLowerCase();
-  return (result.results ?? []).map((record) => ({
-    ...record,
-    score: lowered && record.content.toLowerCase().includes(lowered) ? 0.75 : 0.5
-  }));
+  const results = (await res.json()) as Array<SweepyRecord & { similarity?: number }>;
+
+  return results
+    .filter((r) => !r.tags?.includes("deleted") && !r.tags?.includes("superseded"))
+    .slice(0, input.limit)
+    .map((r) => ({
+      ...sweepyToMemoryRecord(r, input.namespace),
+      score: r.similarity ?? 0.7,
+    }));
 }
 
+/**
+ * 标记记忆被召回（sweepy 没有专用接口，跳过）
+ */
 export async function markMemoriesRecalled(
-  db: D1Database,
-  input: { namespace: string; ids: string[] }
+  _env: Env,
+  _input: { namespace: string; ids: string[] }
 ): Promise<void> {
-  if (input.ids.length === 0) return;
-
-  const placeholders = input.ids.map(() => "?").join(", ");
-  await db
-    .prepare(
-      `UPDATE memories
-       SET last_recalled_at = ?, recall_count = recall_count + 1
-       WHERE namespace = ? AND id IN (${placeholders})`
-    )
-    .bind(nowIso(), input.namespace, ...input.ids)
-    .run();
+  // sweepy 有自己的 activation_count 机制，这里不额外处理
 }

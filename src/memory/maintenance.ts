@@ -28,7 +28,7 @@ async function isDuplicateMemory(
   env: Env,
   input: { namespace: string; memory: ExtractedMemory }
 ): Promise<boolean> {
-  const existing = await searchMemoriesByText(env.DB, {
+  const existing = await searchMemoriesByText(env, {
     namespace: input.namespace,
     query: input.memory.content,
     limit: 5

@@ -1,8 +1,16 @@
+/**
+ * inject.ts — 记忆注入层，sweepy 适配版
+ *
+ * 改动：
+ * 1. 移除 vectorStore 导入（不再使用 Cloudflare Vectorize）
+ * 2. listMemories 调用从 env.DB 改为 env
+ * 3. 搜索统一走 sweepy（通过 search.ts → db/memories.ts → sweepy API）
+ */
+
 import { listMemories } from "../db/memories";
 import type { Env, InjectionMode, KeyProfile, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest } from "../types";
 import { filterAndCompressMemories } from "./filter";
 import { searchMemories, toMemoryApiRecord } from "./search";
-import { listVectorMemories, searchVectorMemories } from "./vectorStore";
 
 function contentToText(content: OpenAIChatMessage["content"]): string {
   if (typeof content === "string") return content;
@@ -36,23 +44,18 @@ function getTopK(env: Env): number {
   return Number.isFinite(value) ? Math.min(Math.max(value, 1), 200) : 12;
 }
 
+/**
+ * 搜索记忆 — 统一走 sweepy
+ */
 async function searchMemoriesForInjection(
   env: Env,
   input: { namespace: string; query: string; topK: number }
 ): Promise<MemoryApiRecord[]> {
   try {
-    if (env.MEMORY_BACKEND === "d1") {
-      return await searchMemories(env, {
-        namespace: input.namespace,
-        query: input.query,
-        topK: input.topK
-      });
-    }
-
-    return await searchVectorMemories(env, {
+    return await searchMemories(env, {
       namespace: input.namespace,
       query: input.query,
-      topK: input.topK
+      topK: input.topK,
     });
   } catch (error) {
     console.error("memory injection search failed", error);
@@ -60,29 +63,20 @@ async function searchMemoriesForInjection(
   }
 }
 
+/**
+ * 列出记忆 — 走 sweepy
+ */
 async function listMemoriesForInjection(
   env: Env,
   input: { namespace: string; limit: number }
 ): Promise<MemoryApiRecord[]> {
-  if (env.MEMORY_BACKEND === "d1") {
-    const records = await listMemories(env.DB, {
-      namespace: input.namespace,
-      status: "active",
-      limit: input.limit
-    });
-    return records.map((record) => toMemoryApiRecord(record));
-  }
-
-  try {
-    const page = await listVectorMemories(env, {
-      namespace: input.namespace,
-      count: Math.min(input.limit, 1000)
-    });
-    return page.data;
-  } catch (error) {
-    console.error("memory injection list failed", error);
-    return [];
-  }
+  // 统一走 sweepy（通过修改后的 listMemories）
+  const records = await listMemories(env, {
+    namespace: input.namespace,
+    status: "active",
+    limit: input.limit,
+  });
+  return records.map((record) => toMemoryApiRecord(record));
 }
 
 function dedupeMemories(memories: MemoryApiRecord[]): MemoryApiRecord[] {
@@ -124,12 +118,12 @@ export async function selectMemoriesForInjection(
   if (mode === "full") {
     const memories = await listMemoriesForInjection(env, {
       namespace,
-      limit: 500
+      limit: 500,
     });
 
     return filterAndCompressMemories(env, {
       query: input.query,
-      memories
+      memories,
     });
   }
 
@@ -137,26 +131,26 @@ export async function selectMemoriesForInjection(
     ? await searchMemoriesForInjection(env, {
         namespace,
         query: input.query,
-        topK: getTopK(env)
+        topK: getTopK(env),
       })
     : [];
 
   if (mode === "rag") {
     return filterAndCompressMemories(env, {
       query: input.query,
-      memories: ragMemories
+      memories: ragMemories,
     });
   }
 
   const records = await listMemoriesForInjection(env, {
     namespace,
-    limit: 500
+    limit: 500,
   });
   const pinned = records.filter((record) => record.pinned);
 
   return filterAndCompressMemories(env, {
     query: input.query,
-    memories: dedupeMemories([...pinned, ...ragMemories])
+    memories: dedupeMemories([...pinned, ...ragMemories]),
   });
 }
 
@@ -179,7 +173,7 @@ export function formatMemoryPatch(memories: MemoryApiRecord[]): string {
     "",
     "<memories>",
     ...lines,
-    "</memories>"
+    "</memories>",
   ].join("\n");
 }
 
@@ -192,7 +186,7 @@ export function injectMemoryPatchAsSystemMessage(
 
   const memoryMessage: OpenAIChatMessage = {
     role: "system",
-    content: patch
+    content: patch,
   };
 
   const messages = [...request.messages];
@@ -206,6 +200,6 @@ export function injectMemoryPatchAsSystemMessage(
 
   return {
     ...request,
-    messages
+    messages,
   };
 }

@@ -1,8 +1,13 @@
+/**
+ * search.ts — 记忆搜索层，改为直接使用 sweepy 向量搜索
+ *
+ * 原版先走 Vectorize 再回退 D1 文本搜索。
+ * 现在直接调 sweepy 的 /api/memories/search，
+ * 由 sweepy 的 qwen3-embedding 提供语义匹配。
+ */
+
 import { fetchMemoriesByIds, markMemoriesRecalled, searchMemoriesByText } from "../db/memories";
 import type { Env, MemoryApiRecord, MemoryRecord } from "../types";
-import { createEmbedding } from "./embedding";
-
-type MetadataMap = Record<string, unknown>;
 
 function parseJsonArray(value: string | null): string[] {
   if (!value) return [];
@@ -34,7 +39,7 @@ export function toMemoryApiRecord(record: MemoryRecord, score?: number): MemoryA
     created_at: record.created_at,
     updated_at: record.updated_at,
     expires_at: record.expires_at,
-    ...(score === undefined ? {} : { score })
+    ...(score === undefined ? {} : { score }),
   };
 }
 
@@ -44,202 +49,30 @@ function getTopK(env: Env, requested?: number): number {
   return Math.min(Math.max(value, 1), 200);
 }
 
-function getMinScore(env: Env): number {
-  const value = Number(env.MEMORY_MIN_SCORE || 0.35);
-  return Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 0.35;
-}
-
-function getRefId(match: VectorizeMatch): string | null {
-  const metadata = (match.metadata || {}) as MetadataMap;
-  const refId = metadata.ref_id;
-  if (typeof refId === "string") return refId;
-  if (match.id.startsWith("mem_")) return match.id.slice("mem_".length);
-  return null;
-}
-
-function readMetadataText(metadata: MetadataMap): string | null {
-  const fields = ["content", "text", "memory", "summary", "document", "chunk", "value", "title"];
-
-  for (const field of fields) {
-    const value = metadata[field];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-
-  return null;
-}
-
-function readMetadataString(metadata: MetadataMap, field: string): string | null {
-  const value = metadata[field];
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function readMetadataNumber(metadata: MetadataMap, field: string, fallback: number): number {
-  const value = metadata[field];
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return fallback;
-}
-
-function readMetadataBoolean(metadata: MetadataMap, field: string): boolean {
-  const value = metadata[field];
-  return value === true || value === "true";
-}
-
-function readMetadataStringArray(metadata: MetadataMap, field: string): string[] {
-  const value = metadata[field];
-  if (Array.isArray(value)) {
-    return value.filter((item): item is string => typeof item === "string");
-  }
-  if (typeof value === "string" && value.trim()) return [value.trim()];
-  return [];
-}
-
-function toLegacyMemoryRecord(
-  match: VectorizeMatch,
-  input: { namespace: string }
-): (MemoryRecord & { score: number }) | null {
-  const metadata = (match.metadata || {}) as MetadataMap;
-  const status = readMetadataString(metadata, "status");
-  if (status && status !== "active") return null;
-
-  const content = readMetadataText(metadata);
-  if (!content) return null;
-
-  const now = new Date(0).toISOString();
-  const id = getRefId(match) || match.id;
-
-  let tags = "[]";
-  const rawTags = metadata.tags;
-  if (typeof rawTags === "string") {
-    tags = rawTags;
-  } else if (Array.isArray(rawTags)) {
-    tags = JSON.stringify(rawTags);
-  }
-
-  return {
-    id,
-    namespace: readMetadataString(metadata, "namespace") || input.namespace,
-    type: readMetadataString(metadata, "type") || "note",
-    content,
-    summary: readMetadataString(metadata, "summary"),
-    importance: readMetadataNumber(metadata, "importance", 0.5),
-    confidence: readMetadataNumber(metadata, "confidence", 0.8),
-    status: "active",
-    pinned: readMetadataBoolean(metadata, "pinned") ? 1 : 0,
-    tags,
-    source: readMetadataString(metadata, "source_id") || readMetadataString(metadata, "source") || "vectorize",
-    source_message_ids: JSON.stringify([]),
-    vector_id: match.id,
-    last_recalled_at: null,
-    recall_count: 0,
-    created_at: readMetadataString(metadata, "created_at") || now,
-    updated_at: readMetadataString(metadata, "updated_at") || now,
-    expires_at: null,
-    score: match.score
-  };
-}
-
-async function queryVectorize(
-  env: Env,
-  vector: number[],
-  input: { namespace: string; types?: string[]; topK: number },
-  useFilter: boolean
-): Promise<VectorizeMatches> {
-  if (!useFilter) {
-    return env.VECTORIZE!.query(vector, {
-      topK: input.topK,
-      returnMetadata: true
-    });
-  }
-
-  const filter: VectorizeVectorMetadataFilter = {
-    namespace: input.namespace,
-    status: "active"
-  };
-
-  if (input.types && input.types.length > 0) {
-    filter.type = { $in: input.types };
-  }
-
-  return env.VECTORIZE!.query(vector, {
-    topK: input.topK,
-    namespace: input.namespace,
-    returnMetadata: true,
-    filter
-  });
-}
-
-async function searchWithVectorize(
-  env: Env,
-  input: { namespace: string; query: string; types?: string[]; topK: number }
-): Promise<Array<MemoryRecord & { score: number }> | null> {
-  if (!env.VECTORIZE || !input.query.trim()) return null;
-
-  const vector = await createEmbedding(env, input.query);
-  if (!vector) return null;
-
-  let result = await queryVectorize(env, vector, input, true);
-  if (result.matches.length === 0) {
-    result = await queryVectorize(env, vector, input, false);
-  }
-
-  const minScore = getMinScore(env);
-  const scoredIds = new Map<string, number>();
-  const legacyRecords: Array<MemoryRecord & { score: number }> = [];
-
-  for (const match of result.matches) {
-    if (match.score < minScore) continue;
-    const id = getRefId(match);
-    if (id) scoredIds.set(id, match.score);
-    const legacy = toLegacyMemoryRecord(match, input);
-    if (legacy) legacyRecords.push(legacy);
-  }
-
-  const allRecords = await fetchMemoriesByIds(env.DB, {
-    namespace: input.namespace,
-    ids: [...scoredIds.keys()]
-  });
-
-  // Only return active memories — expired/deleted/superseded must not be injected
-  const activeRecords = allRecords.filter((record) => record.status === "active");
-
-  // Use allRecords (not just active) so inactive D1 records block legacy fallback
-  const foundD1Ids = new Set(allRecords.map((record) => record.id));
-  const d1Records = activeRecords.map((record) => ({ ...record, score: scoredIds.get(record.id) ?? 0 }));
-  const legacyOnlyRecords = legacyRecords.filter((record) => !foundD1Ids.has(record.id));
-
-  return [...d1Records, ...legacyOnlyRecords].sort(
-    (a, b) => b.score + b.importance * 0.05 - (a.score + a.importance * 0.05)
-  );
-}
-
+/**
+ * 搜索记忆 — 直接走 sweepy 语义搜索
+ *
+ * sweepy 的 /api/memories/search 底层是 qwen3-embedding-8b 向量搜索，
+ * 余弦相似度阈值 0.4，比 Aelios 原版的 Cloudflare Vectorize 更适合中文语境。
+ */
 export async function searchMemories(
   env: Env,
   input: { namespace: string; query: string; types?: string[]; topK?: number }
 ): Promise<MemoryApiRecord[]> {
   const topK = getTopK(env, input.topK);
-  let records = await searchWithVectorize(env, {
+
+  // 直接调 sweepy 搜索（已在 db/memories.ts 里封装）
+  const records = await searchMemoriesByText(env, {
     namespace: input.namespace,
     query: input.query,
     types: input.types,
-    topK
+    limit: topK,
   });
 
-  if (!records || records.length === 0) {
-    records = await searchMemoriesByText(env.DB, {
-      namespace: input.namespace,
-      query: input.query,
-      types: input.types,
-      limit: Math.max(topK, 50)
-    });
-  }
-
-  await markMemoriesRecalled(env.DB, {
+  // 标记被召回（sweepy 内部处理）
+  await markMemoriesRecalled(env, {
     namespace: input.namespace,
-    ids: records.map((record) => record.id)
+    ids: records.map((record) => record.id),
   });
 
   return records.map((record) => toMemoryApiRecord(record, record.score));

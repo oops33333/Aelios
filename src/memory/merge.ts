@@ -228,7 +228,7 @@ async function findMergeCandidates(
 }
 
 async function createNewMemory(env: Env, input: PersistMemoryInput): Promise<MemoryRecord> {
-  const created = await createMemory(env.DB, {
+  const created = await createMemory(env, {
     namespace: input.namespace,
     type: input.memory.type,
     content: input.memory.content,
@@ -274,7 +274,7 @@ export async function persistMemoryWithMerge(
     return createNewMemory(env, input);
   }
 
-  const existing = await getMemoryById(env.DB, { namespace: input.namespace, id: target.id });
+  const existing = await getMemoryById(env, { namespace: input.namespace, id: target.id });
   if (!existing || existing.status !== "active" || existing.pinned) {
     return createNewMemory(env, input);
   }
@@ -282,7 +282,7 @@ export async function persistMemoryWithMerge(
   if (decision.action === "merge") {
     if (!decision.content) return createNewMemory(env, input);
 
-    const merged = await updateMemory(env.DB, {
+    const merged = await updateMemory(env, {
       namespace: input.namespace,
       id: existing.id,
       patch: {
@@ -300,7 +300,7 @@ export async function persistMemoryWithMerge(
   }
 
   if (decision.action === "supersede") {
-    const superseded = await updateMemory(env.DB, {
+    const superseded = await updateMemory(env, {
       namespace: input.namespace,
       id: existing.id,
       patch: { status: "superseded" }
