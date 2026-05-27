@@ -67,6 +67,7 @@ export async function handleChatCompletions(
   env: Env,
   ctx: ExecutionContext
 ): Promise<Response> {
+ try {
   const auth = await authenticate(request, env);
   if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
 
@@ -334,4 +335,9 @@ export async function handleChatCompletions(
       "content-type": "application/json; charset=utf-8"
     }
   });
+ } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('CRASH', msg);
+    return openAiError('Internal: ' + msg, 500);
+  }
 }
