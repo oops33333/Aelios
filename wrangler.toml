@@ -1,4 +1,4 @@
-name = "companion-memory-proxy"
+name = "aelios"
 account_id = "60d6f22af1c7502b6ea16028a3823136"
 main = "src/index.ts"
 compatibility_date = "2026-04-01"
@@ -65,6 +65,7 @@ CUSTOM_ANTHROPIC_MESSAGES_PATH = "messages"
 # SWEEPY_AUTH = "SET_IN_DASHBOARD"
 # CHATBOX_API_KEY, MEMORY_MCP_API_KEY, GUIDE_DOG_API_KEY
 # AI_GATEWAY_BASE_URL（如果 MEMORY_FILTER_MODEL 需要 Workers AI）
+[ai]
 binding = "AI"
 
 # ─── Vectorize 已移除，由 sweepy 向量搜索替代 ───
