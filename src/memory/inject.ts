@@ -203,8 +203,9 @@ export async function injectMemoryPatchAsSystemMessage(
 ): Promise<OpenAIChatRequest> {
   let patch = formatMemoryPatch(memories);
 
-  // Fetch and append date reminders from sweepy
-  if (env) {
+  // Fetch and append date reminders from sweepy (first round only)
+  const userMsgCount = request.messages.filter((m) => m.role === "user").length;
+  if (env && userMsgCount <= 1) {
     const reminders = await fetchSweepyReminders(env);
     if (reminders.length > 0) {
       const reminderBlock = "\n\n<reminders>\n" + reminders.join("\n") + "\n</reminders>";
