@@ -84,6 +84,26 @@ export function buildOpenAICompatHeaders(env: Env): Headers {
   return headers;
 }
 
+
+// ─── Chat 专用：走 AI Gateway，不走 OpenRouter ───
+
+export async function callChatViaGateway(env: Env, body: OpenAIChatRequest): Promise<Response> {
+  const baseUrl = normalizeAiGatewayBaseUrl(env);
+  if (!baseUrl) throw new Error("AI_GATEWAY_BASE_URL is not configured");
+
+  const url = `${baseUrl}/compat/chat/completions`;
+  const headers = new Headers({ "content-type": "application/json" });
+  if (env.CF_AIG_TOKEN) {
+    headers.set("cf-aig-authorization", `Bearer ${env.CF_AIG_TOKEN}`);
+  }
+
+  return fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+}
+
 export async function callOpenAICompat(env: Env, body: OpenAIChatRequest): Promise<Response> {
   return fetch(getOpenAICompatUrl(env), {
     method: "POST",

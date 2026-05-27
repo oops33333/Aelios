@@ -17,7 +17,7 @@ import {
   getAnthropicCacheMode,
   parseAnthropicNonStream
 } from "../proxy/anthropicAdapter";
-import { buildOpenAICompatRequest, buildOpenAIRequestFromAssembled, callOpenAICompat } from "../proxy/openaiAdapter";
+import { buildOpenAICompatRequest, buildOpenAIRequestFromAssembled, callChatViaGateway } from "../proxy/openaiAdapter";
 import { classifyProvider, resolveTargetModel } from "../proxy/resolveModel";
 import { streamAnthropicToOpenAI } from "../proxy/streamAnthropic";
 import { streamOpenAIWithTee } from "../proxy/streamOpenAI";
@@ -158,7 +158,7 @@ export async function handleChatCompletions(
         // Tool messages / tool_calls not yet supported by assembler — fall back
         const patchedBody = await injectMemoryPatchAsSystemMessage(body, memories, env);
         const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel);
-        upstream = await callOpenAICompat(env, upstreamRequest);
+        upstream = await callChatViaGateway(env, upstreamRequest);
       } else {
         const assembled = assemble({
           request: body,
@@ -168,7 +168,7 @@ export async function handleChatCompletions(
           visionOutput: null,
         });
         clientSystemHash = assembled.meta.client_system_hash;
-        upstream = await callOpenAICompat(env, buildOpenAIRequestFromAssembled(body, targetModel, assembled));
+        upstream = await callChatViaGateway(env, buildOpenAIRequestFromAssembled(body, targetModel, assembled));
       }
     }
   } catch (error) {

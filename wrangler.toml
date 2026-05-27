@@ -36,7 +36,7 @@ MEMORY_TOP_K = "12"
 
 # ─── sweepy 记忆库 ───
 SWEEPY_URL = "https://sweepy.cloud"
-AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/60d6f22af1c7502b6ea16028a3823136/ginna"
+AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/60d6f22af1c7502b6ea16028a3823136/default"
 # SWEEPY_AUTH 放在 Cloudflare Dashboard Secrets 里：SET_IN_DASHBOARD
 
 # ─── embedding 由 sweepy 处理，以下仅为兼容保留 ───
