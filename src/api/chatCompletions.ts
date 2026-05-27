@@ -156,7 +156,7 @@ export async function handleChatCompletions(
     } else {
       if (hasToolContent(body)) {
         // Tool messages / tool_calls not yet supported by assembler — fall back
-        const patchedBody = injectMemoryPatchAsSystemMessage(body, memories);
+        const patchedBody = await injectMemoryPatchAsSystemMessage(body, memories, env);
         const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel);
         upstream = await callOpenAICompat(env, upstreamRequest);
       } else {

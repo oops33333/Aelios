@@ -154,6 +154,25 @@ export async function selectMemoriesForInjection(
   });
 }
 
+
+async function fetchSweepyReminders(env: Env): Promise<string[]> {
+  try {
+    const base = (env.SWEEPY_URL || "https://sweepy.cloud").replace(/\/+$/, "");
+    const auth = env.SWEEPY_AUTH || "";
+    const res = await fetch(base + "/api/memories/reminders", {
+      headers: {
+        authorization: "Basic " + btoa(auth),
+      },
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as Array<{ name: string; days_until: number; message: string }>;
+    if (!Array.isArray(data) || data.length === 0) return [];
+    return data.map((r) => "[reminder] " + r.message);
+  } catch {
+    return [];
+  }
+}
+
 export function formatMemoryPatch(memories: MemoryApiRecord[]): string {
   if (memories.length === 0) return "";
 
@@ -177,11 +196,22 @@ export function formatMemoryPatch(memories: MemoryApiRecord[]): string {
   ].join("\n");
 }
 
-export function injectMemoryPatchAsSystemMessage(
+export async function injectMemoryPatchAsSystemMessage(
   request: OpenAIChatRequest,
-  memories: MemoryApiRecord[]
-): OpenAIChatRequest {
-  const patch = formatMemoryPatch(memories);
+  memories: MemoryApiRecord[],
+  env?: Env
+): Promise<OpenAIChatRequest> {
+  let patch = formatMemoryPatch(memories);
+
+  // Fetch and append date reminders from sweepy
+  if (env) {
+    const reminders = await fetchSweepyReminders(env);
+    if (reminders.length > 0) {
+      const reminderBlock = "\n\n<reminders>\n" + reminders.join("\n") + "\n</reminders>";
+      patch = patch ? patch + reminderBlock : reminderBlock;
+    }
+  }
+
   if (!patch) return request;
 
   const memoryMessage: OpenAIChatMessage = {
