@@ -1,4 +1,4 @@
-name = "companion-memory-proxy"
+name = "aelios"
 account_id = "60d6f22af1c7502b6ea16028a3823136"
 main = "src/index.ts"
 compatibility_date = "2026-04-01"
