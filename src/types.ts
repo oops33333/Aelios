@@ -17,6 +17,7 @@ export interface Env {
   MEMORY_MCP_API_KEY?: string;
   GUIDE_DOG_API_KEY?: string;
   CF_AIG_TOKEN?: string;
+  CF_GATEWAY_CHAT_TOKEN?: string;
   ENABLE_AUTO_MEMORY?: string;
   ENABLE_INCREMENTAL_MEMORY?: string;
   ENABLE_DAILY_MEMORY_DIGEST?: string;
