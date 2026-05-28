@@ -53,6 +53,7 @@ const visibleVarNames = [
   "OPENROUTER_API_KEY",
   "OPENROUTER_BASE_URL",
   "SWEEPY_AUTH",
+  "CF_AIG_TOKEN",
   "SWEEPY_URL"
 ];
 
