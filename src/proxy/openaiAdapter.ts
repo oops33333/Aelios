@@ -36,8 +36,10 @@ export function buildOpenAIRequestFromAssembled(
 
 // ─── URL 和 Headers 路由 ───
 
-function useOpenRouter(env: Env): boolean {
-  return Boolean(env.OPENROUTER_API_KEY);
+function useOpenRouter(env: Env, model?: string): boolean {
+  if (!env.OPENROUTER_API_KEY) return false;
+  if (model && model.toLowerCase().includes("deepseek")) return true;
+  return false;
 }
 
 function getOpenRouterBaseUrl(env: Env): string {
@@ -58,19 +60,19 @@ export function normalizeAiGatewayBaseUrl(env: Env): string {
     .replace(/\/anthropic\/v1\/messages$/i, "");
 }
 
-export function getOpenAICompatUrl(env: Env): string {
-  if (useOpenRouter(env)) {
+export function getOpenAICompatUrl(env: Env, model?: string): string {
+  if (useOpenRouter(env, model)) {
     return `${getOpenRouterBaseUrl(env)}/v1/chat/completions`;
   }
   return `${normalizeAiGatewayBaseUrl(env)}/compat/chat/completions`;
 }
 
-export function buildOpenAICompatHeaders(env: Env): Headers {
+export function buildOpenAICompatHeaders(env: Env, model?: string): Headers {
   const headers = new Headers({
     "content-type": "application/json",
   });
 
-  if (useOpenRouter(env)) {
+  if (useOpenRouter(env, model)) {
     headers.set("authorization", `Bearer ${env.OPENROUTER_API_KEY}`);
     // OpenRouter 推荐设置的 header
     headers.set("http-referer", "https://sweepy.cloud");
@@ -85,9 +87,10 @@ export function buildOpenAICompatHeaders(env: Env): Headers {
 }
 
 export async function callOpenAICompat(env: Env, body: OpenAIChatRequest): Promise<Response> {
-  return fetch(getOpenAICompatUrl(env), {
+  const model = body.model;
+  return fetch(getOpenAICompatUrl(env, model), {
     method: "POST",
-    headers: buildOpenAICompatHeaders(env),
+    headers: buildOpenAICompatHeaders(env, model),
     body: JSON.stringify(body),
   });
 }

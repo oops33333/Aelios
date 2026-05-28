@@ -9,6 +9,7 @@ crons = ["10 20 * * *"]
 
 [vars]
 PUBLIC_MODEL_NAME = "companion"
+ALLOW_MODEL_PASSTHROUGH = "true"
 
 # ─── 模型配置（走 OpenRouter）───
 # OpenRouter 格式的模型名称
