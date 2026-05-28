@@ -332,7 +332,6 @@ export function buildAnthropicHeaders(env: Env): Headers {
   const headers = new Headers({
     "content-type": "application/json",
     "anthropic-version": "2023-06-01",
-    "cf-aig-skip-cache": "true"
   });
 
   if (env.CF_AIG_TOKEN) {
