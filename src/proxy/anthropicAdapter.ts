@@ -332,6 +332,7 @@ export function buildAnthropicHeaders(env: Env): Headers {
   const headers = new Headers({
     "content-type": "application/json",
     "anthropic-version": "2023-06-01",
+    "anthropic-beta": "prompt-caching-2024-07-31",
   });
 
   if (env.CF_AIG_TOKEN) {
