@@ -17,7 +17,7 @@ import {
   getAnthropicCacheMode,
   parseAnthropicNonStream
 } from "../proxy/anthropicAdapter";
-import { buildOpenAICompatRequest, buildOpenAIRequestFromAssembled, callChatViaGateway } from "../proxy/openaiAdapter";
+import { buildOpenAICompatRequest, buildOpenAIRequestFromAssembled, callOpenAICompat } from "../proxy/openaiAdapter";
 import { classifyProvider, resolveTargetModel } from "../proxy/resolveModel";
 import { streamAnthropicToOpenAI } from "../proxy/streamAnthropic";
 import { streamOpenAIWithTee } from "../proxy/streamOpenAI";
@@ -67,7 +67,6 @@ export async function handleChatCompletions(
   env: Env,
   ctx: ExecutionContext
 ): Promise<Response> {
- try {
   const auth = await authenticate(request, env);
   if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
 
@@ -159,7 +158,7 @@ export async function handleChatCompletions(
         // Tool messages / tool_calls not yet supported by assembler — fall back
         const patchedBody = await injectMemoryPatchAsSystemMessage(body, memories, env);
         const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel);
-        upstream = await callChatViaGateway(env, upstreamRequest);
+        upstream = await callOpenAICompat(env, upstreamRequest);
       } else {
         const assembled = assemble({
           request: body,
@@ -169,7 +168,7 @@ export async function handleChatCompletions(
           visionOutput: null,
         });
         clientSystemHash = assembled.meta.client_system_hash;
-        upstream = await callChatViaGateway(env, buildOpenAIRequestFromAssembled(body, targetModel, assembled));
+        upstream = await callOpenAICompat(env, buildOpenAIRequestFromAssembled(body, targetModel, assembled));
       }
     }
   } catch (error) {
@@ -335,9 +334,4 @@ export async function handleChatCompletions(
       "content-type": "application/json; charset=utf-8"
     }
   });
- } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error('CRASH', msg);
-    return openAiError('Internal: ' + msg, 500);
-  }
 }
