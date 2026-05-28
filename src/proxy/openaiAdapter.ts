@@ -94,7 +94,7 @@ export async function callChatViaGateway(env: Env, body: OpenAIChatRequest): Pro
   const url = `${baseUrl}/compat/chat/completions`;
   const headers = new Headers({ "content-type": "application/json" });
   if (env.CF_AIG_TOKEN) {
-    headers.set("cf-aig-authorization", `Bearer ${env.CF_AIG_TOKEN}`);
+    headers.set("authorization", `Bearer ${env.CF_AIG_TOKEN}`);
   }
 
   return fetch(url, {
