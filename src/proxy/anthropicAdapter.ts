@@ -253,6 +253,7 @@ function getRequestThinkingDirective(req: OpenAIChatRequest): { enabled?: boolea
 }
 
 function buildThinkingConfig(env: Env, req: OpenAIChatRequest): AnthropicRequest["thinking"] | undefined {
+  if (env.ANTHROPIC_THINKING_ENABLED === "false") return undefined;
   const requestDirective = getRequestThinkingDirective(req);
   if (requestDirective.enabled === false) return undefined;
 
