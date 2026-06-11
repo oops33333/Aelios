@@ -1,7 +1,7 @@
 import { saveAssistantMessage } from "../db/messages";
 import { saveUsageLog } from "../db/usageLogs";
 import { enqueueMemoryMaintenanceIfNeeded, enqueueRetentionIfNeeded } from "../queue/producer";
-import { getAnthropicCacheMode, normalizeAnthropicUsage } from "./anthropicAdapter";
+import { getAnthropicCacheMode, mapAnthropicStopReason, normalizeAnthropicUsage } from "./anthropicAdapter";
 import {
   createThinkingFilterState,
   flushStreamFilter,
@@ -24,22 +24,40 @@ interface StreamAnthropicOptions {
   cacheAnchorBlock?: string | null;
 }
 
+interface StreamToolCallDelta {
+  index: number;
+  id?: string;
+  type?: "function";
+  function?: { name?: string; arguments?: string };
+}
+
+interface StreamDelta {
+  content?: string;
+  reasoning_content?: string;
+  tool_calls?: StreamToolCallDelta[];
+  thinking_blocks?: Array<{ type: "thinking"; thinking: string; signature?: string }>;
+}
+
 interface StreamState {
   assistantText: string;
   reasoningText: string;
+  thinkingSignature: string;
   finishReason: string | null;
   usage?: TokenUsage;
   thinkingFilter: ThinkingFilterState;
+  /** Anthropic content block index → OpenAI tool_calls index */
+  toolCallIndexByBlock: Map<number, number>;
+  toolCallCount: number;
 }
 
-function openAIChunk(delta: { content?: string; reasoning_content?: string }): Uint8Array {
+function openAIChunk(delta: StreamDelta, finishReason: string | null = null): Uint8Array {
   return new TextEncoder().encode(
     `data: ${JSON.stringify({
       choices: [
         {
           index: 0,
           delta,
-          finish_reason: null
+          finish_reason: finishReason
         }
       ]
     })}\n\n`
@@ -50,14 +68,22 @@ function doneChunk(): Uint8Array {
   return new TextEncoder().encode("data: [DONE]\n\n");
 }
 
-function consumeAnthropicData(data: string, state: StreamState): { content?: string; reasoning_content?: string } | null {
+function consumeAnthropicData(data: string, state: StreamState): StreamDelta | null {
   try {
     const parsed = JSON.parse(data) as {
       type?: string;
+      index?: number;
+      content_block?: {
+        type?: string;
+        id?: string;
+        name?: string;
+      };
       delta?: {
         type?: string;
         text?: string;
         thinking?: string;
+        signature?: string;
+        partial_json?: string;
         stop_reason?: string | null;
       };
       usage?: TokenUsage;
@@ -68,6 +94,46 @@ function consumeAnthropicData(data: string, state: StreamState): { content?: str
 
     if (parsed.type === "message_start" && parsed.message?.usage) {
       state.usage = normalizeAnthropicUsage(parsed.message.usage);
+    }
+
+    // tool_use 块开场：登记块号→工具序号映射，向客户端发出 id/name 帧
+    if (
+      parsed.type === "content_block_start" &&
+      parsed.content_block?.type === "tool_use" &&
+      typeof parsed.index === "number"
+    ) {
+      const toolIndex = state.toolCallCount;
+      state.toolCallCount += 1;
+      state.toolCallIndexByBlock.set(parsed.index, toolIndex);
+      return {
+        tool_calls: [
+          {
+            index: toolIndex,
+            id: parsed.content_block.id || `toolu_${toolIndex}`,
+            type: "function",
+            function: { name: parsed.content_block.name || "", arguments: "" }
+          }
+        ]
+      };
+    }
+
+    // tool_use 入参增量：partial_json → arguments 增量帧
+    if (
+      parsed.type === "content_block_delta" &&
+      parsed.delta?.type === "input_json_delta" &&
+      typeof parsed.index === "number" &&
+      state.toolCallIndexByBlock.has(parsed.index)
+    ) {
+      const partial = parsed.delta.partial_json ?? "";
+      if (!partial) return null;
+      return {
+        tool_calls: [
+          {
+            index: state.toolCallIndexByBlock.get(parsed.index)!,
+            function: { arguments: partial }
+          }
+        ]
+      };
     }
 
     if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta" && parsed.delta.text) {
@@ -83,6 +149,12 @@ function consumeAnthropicData(data: string, state: StreamState): { content?: str
       // reasoning_content is NEVER filtered — pass through as-is.
       state.reasoningText += parsed.delta.thinking;
       return { reasoning_content: parsed.delta.thinking };
+    }
+
+    // thinking 签名：暂存，流末以 thinking_blocks 帧整体返还，供工具回环回传
+    if (parsed.type === "content_block_delta" && parsed.delta?.type === "signature_delta" && parsed.delta.signature) {
+      state.thinkingSignature += parsed.delta.signature;
+      return null;
     }
 
     if (parsed.type === "message_delta") {
@@ -155,8 +227,11 @@ export function streamAnthropicToOpenAI(upstream: Response, options: StreamAnthr
   const state: StreamState = {
     assistantText: "",
     reasoningText: "",
+    thinkingSignature: "",
     finishReason: null,
-    thinkingFilter: createThinkingFilterState()
+    thinkingFilter: createThinkingFilterState(),
+    toolCallIndexByBlock: new Map(),
+    toolCallCount: 0
   };
 
   void (async () => {
@@ -195,6 +270,29 @@ export function streamAnthropicToOpenAI(upstream: Response, options: StreamAnthr
         state.assistantText += trailing;
         await writer.write(openAIChunk({ content: trailing }));
       }
+
+      // 带签名的 thinking 整块返还（LiteLLM 风格），供客户端工具回环时回传
+      if (state.thinkingSignature && state.reasoningText) {
+        await writer.write(
+          openAIChunk({
+            thinking_blocks: [
+              {
+                type: "thinking",
+                thinking: state.reasoningText,
+                signature: state.thinkingSignature
+              }
+            ]
+          })
+        );
+      }
+
+      // 收束帧：tool_use → tool_calls，end_turn → stop
+      await writer.write(
+        openAIChunk(
+          {},
+          mapAnthropicStopReason(state.finishReason) ?? (state.toolCallCount > 0 ? "tool_calls" : "stop")
+        )
+      );
 
       await writer.write(doneChunk());
       await writer.close();
