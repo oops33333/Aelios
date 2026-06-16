@@ -188,7 +188,7 @@ export function formatMemoryPatch(memories: MemoryApiRecord[]): string {
 
   return [
     "以下是你自然记得的长期记忆。只有在相关时使用，不要机械复述。",
-    "不要说“根据记忆库”“系统记录”或暴露任何代理层实现。",
+    '不要说\u201C根据记忆库\u201D\u201C系统记录\u201D或暴露任何代理层实现。',
     "",
     "<memories>",
     ...lines,
