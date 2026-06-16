@@ -52,6 +52,9 @@ export interface AssemblerContext {
   /** Vision assistant output for the current round (image present, main model non-multimodal). */
   visionOutput: string | null;
 
+  /** Compressed summary of old conversation history, or null if no compression. */
+  compressedSummary: string | null;
+
   /** Frontend messages excluding the final user message. */
   historyMessages: OpenAIChatMessage[];
 
@@ -89,6 +92,7 @@ export const BLOCK_ORDER: readonly string[] = [
   "long_term_summary",
   "preset_lite",
   "client_system",
+  "compressed_summary",
   "client_volatile_context",
   "dynamic_memory_patch",
   "vision_context",

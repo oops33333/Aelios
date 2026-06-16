@@ -6,6 +6,7 @@ import { saveAssistantMessage, saveUserMessages } from "../db/messages";
 import { getLatestSummary } from "../db/summaries";
 import { saveUsageLog } from "../db/usageLogs";
 import { extractLastUserText, injectMemoryPatchAsSystemMessage, selectMemoriesForInjection } from "../memory/inject";
+import { compressHistoryIfNeeded } from "../memory/compress";
 import { toMemoryApiRecord } from "../memory/search";
 import { assemble } from "../assembler/assemble";
 import { PERSONA_MEMORY_TYPES } from "../assembler/types";
@@ -115,13 +116,20 @@ export async function handleChatCompletions(
   });
   const latestUserMessageId = savedUserMessageIds[savedUserMessageIds.length - 1];
 
-  const memories = await selectMemoriesForInjection(env, {
-    profile: auth.profile,
-    query: extractLastUserText(body.messages)
-  });
+  // History compression + memory search + persona + summary in parallel
+  const userQuery = extractLastUserText(body.messages);
+  const [compressResult, memories, pinnedPersonaMemories, latestSummary] = await Promise.all([
+    compressHistoryIfNeeded(env, body.messages, auth.profile.namespace),
+    selectMemoriesForInjection(env, { profile: auth.profile, query: userQuery }),
+    fetchPinnedPersonaMemories(env, auth.profile.namespace),
+    getLatestSummary(env.DB, auth.profile.namespace),
+  ]);
 
-  const pinnedPersonaMemories = await fetchPinnedPersonaMemories(env, auth.profile.namespace);
-  const latestSummary = await getLatestSummary(env.DB, auth.profile.namespace);
+  // If compression happened, use trimmed messages for the assembler
+  const assemblerBody = compressResult.summary
+    ? { ...body, messages: compressResult.messages }
+    : body;
+  const compressedSummary = compressResult.summary;
   const summaryEntry = latestSummary ? { content: latestSummary.content } : null;
 
   let upstream: Response;
@@ -140,11 +148,12 @@ export async function handleChatCompletions(
         upstream = await callAnthropicNative(env, anthropicRequest, targetModel);
       } else {
         const assembled = assemble({
-          request: body,
+          request: assemblerBody,
           pinnedPersonaMemories,
           summaryEntry,
           ragMemories: memories,
           visionOutput: null,
+          compressedSummary,
         });
         clientSystemHash = assembled.meta.client_system_hash;
         cacheAnchorBlock = assembled.meta.anchor_index >= 0 ? "client_system" : null;
@@ -161,11 +170,12 @@ export async function handleChatCompletions(
         upstream = await callOpenAICompat(env, upstreamRequest);
       } else {
         const assembled = assemble({
-          request: body,
+          request: assemblerBody,
           pinnedPersonaMemories,
           summaryEntry,
           ragMemories: memories,
           visionOutput: null,
+          compressedSummary,
         });
         clientSystemHash = assembled.meta.client_system_hash;
         upstream = await callOpenAICompat(env, buildOpenAIRequestFromAssembled(body, targetModel, assembled));

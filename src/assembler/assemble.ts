@@ -40,6 +40,9 @@ export interface AssembleInput {
 
   /** Vision assistant output (image present + main model non-multimodal). */
   visionOutput: string | null;
+
+  /** Compressed summary of old conversation history, or null. */
+  compressedSummary: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +68,7 @@ export function assemble(input: AssembleInput): AssembledPrompt {
     summaryEntry: input.summaryEntry,
     ragMemories: input.ragMemories,
     visionOutput: input.visionOutput,
+    compressedSummary: input.compressedSummary,
     historyMessages: extractHistoryMessages(request.messages),
     currentUserMessage: extractLastUserMessage(request.messages),
   };

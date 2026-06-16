@@ -241,6 +241,31 @@ const clientSystemBlock: Block = {
   },
 };
 
+
+// ---------------------------------------------------------------------------
+// Block 5.25: compressed_summary (stable, cache_anchor = true)
+// Compressed summary of old conversation history.
+// Only present when history exceeds threshold and compression is enabled.
+// Acts as a second cache layer — changes only every ~25 rounds.
+// ---------------------------------------------------------------------------
+
+const compressedSummaryBlock: Block = {
+  id: "compressed_summary",
+  kind: "stable",
+  role: "system",
+  cache_anchor: true,
+  content_fn: (ctx: AssemblerContext): string | null => {
+    if (!ctx.compressedSummary) return null;
+    return [
+      "[以下是之前对话的压缩摘要]",
+      "",
+      ctx.compressedSummary,
+      "",
+      "[摘要结束，以下是最近的对话]",
+    ].join("\n");
+  },
+};
+
 // ---------------------------------------------------------------------------
 // Block 5.5: client_volatile_context (dynamic)
 // Frontend time/date lines split out of client_system so they do not poison
@@ -351,6 +376,7 @@ const BLOCK_MAP = new Map<string, Block>([
   [longTermSummaryBlock.id, longTermSummaryBlock],
   [presetLiteBlock.id, presetLiteBlock],
   [clientSystemBlock.id, clientSystemBlock],
+  [compressedSummaryBlock.id, compressedSummaryBlock],
   [clientVolatileContextBlock.id, clientVolatileContextBlock],
   [dynamicMemoryPatchBlock.id, dynamicMemoryPatchBlock],
   [visionContextBlock.id, visionContextBlock],

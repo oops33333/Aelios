@@ -670,16 +670,18 @@ export function buildAnthropicRequestFromAssembled(
 }
 
 function applyCacheOverrides(systemBlocks: AnthropicTextBlock[], env: Env): void {
-  const anchor = systemBlocks.find((b) => b.cache_control);
-  if (!anchor) return;
+  const anchors = systemBlocks.filter((b) => b.cache_control);
+  if (anchors.length === 0) return;
 
   if (env.ANTHROPIC_CACHE_ENABLED === "false") {
-    delete anchor.cache_control;
+    for (const anchor of anchors) delete anchor.cache_control;
     return;
   }
 
   const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
-  anchor.cache_control = { type: "ephemeral", ttl };
+  for (const anchor of anchors) {
+    anchor.cache_control = { type: "ephemeral", ttl };
+  }
 }
 
 export async function callAnthropicNative(env: Env, body: AnthropicRequest, targetModel?: string): Promise<Response> {
