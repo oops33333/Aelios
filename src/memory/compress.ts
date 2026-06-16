@@ -97,7 +97,11 @@ export async function compressHistoryIfNeeded(
     },
   };
 
-  if (!isEnabled(env)) return noopResult;
+  if (!isEnabled(env)) {
+    console.log("[compress] DISABLED - ENABLE_HISTORY_COMPRESSION is not 'true'");
+    return noopResult;
+  }
+  console.log("[compress] ENABLED, checking messages...");
 
   const systemMessages = messages.filter(m => m.role === "system");
   const chatMessages = messages.filter(m => m.role === "user" || m.role === "assistant");
@@ -108,7 +112,11 @@ export async function compressHistoryIfNeeded(
   const threshold = getThreshold(env);
   const keepRecent = getKeepRecent(env);
 
-  if (chatMessages.length <= threshold) return noopResult;
+  console.log(`[compress] chatMessages=${chatMessages.length}, threshold=${threshold}, keepRecent=${keepRecent}`);
+  if (chatMessages.length <= threshold) {
+    console.log("[compress] below threshold, skipping");
+    return noopResult;
+  }
 
   const windowSize = threshold - keepRecent;
   const completeWindows = Math.floor((chatMessages.length - keepRecent) / windowSize);
@@ -130,6 +138,7 @@ export async function compressHistoryIfNeeded(
   const finalKey = buildSegmentCacheKey(namespace, completeWindows, chatMessages, windowSize);
   const finalCached = await tryGetCache(env.DB, namespace, finalKey);
   if (finalCached) {
+    console.log("[compress] CACHE HIT on final segment");
     return {
       summary: finalCached,
       messages: [...systemMessages, ...recent],
@@ -169,7 +178,9 @@ export async function compressHistoryIfNeeded(
     const segMessages = chatMessages.slice(segStart, segEnd);
 
     try {
+      console.log(`[compress] calling model for segment ${seg}, model=${getCompressModel(env)}`);
       summary = await callCompressModel(env, segMessages, summary);
+      console.log(`[compress] segment ${seg} compressed OK, summary length=${summary.length}`);
       segmentsComputed++;
     } catch (error) {
       console.error(`[compress] segment ${seg} failed:`, error);
