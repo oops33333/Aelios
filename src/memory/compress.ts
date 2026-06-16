@@ -1,13 +1,22 @@
 /**
- * compress.ts — 对话历史自动压缩
+ * compress.ts — 对话历史自动压缩（级联版）
  *
  * 当 RikkaHub 发来的完整历史超过阈值（默认 30 轮）时，
- * 把旧消息压缩成摘要，只保留最近 N 轮原文。
+ * 按 windowSize（默认 25）条一段做级联压缩：
  *
- * 分段压缩策略：按 windowSize（= threshold - keepRecent）条消息为一段，
- * 只在完成一个完整段时触发压缩。段内多次请求复用 D1 缓存。
+ *   seg 1: messages[0..24]           → summary_1
+ *   seg 2: summary_1 + messages[25..49] → summary_2
+ *   seg 3: summary_2 + messages[50..74] → summary_3
+ *   ...
  *
- * 与记忆搜索并行执行（Promise.all），不增加总延迟。
+ * 每段输入量固定（~上轮摘要 800 字 + 25 条消息），
+ * 不随对话长度线性增长，可以支撑任意长对话。
+ *
+ * 缓存策略：
+ *   - 每段独立缓存在 D1 cache_entries
+ *   - key 含段号 + 首条消息指纹，防跨对话缓存碰撞
+ *   - 快路径：先查最终段缓存，命中则直接返回
+ *   - 慢路径：从最后一个命中段开始级联，逐段压缩+缓存
  */
 
 import { getCacheEntry, putCacheEntry, parseCacheEntryValue } from "../db/cacheEntries";
@@ -15,7 +24,7 @@ import { callOpenAICompat } from "../proxy/openaiAdapter";
 import type { Env, OpenAIChatMessage } from "../types";
 
 // ---------------------------------------------------------------------------
-// 配置读取
+// 配置
 // ---------------------------------------------------------------------------
 
 const DEFAULT_THRESHOLD = 30;
@@ -57,29 +66,21 @@ function isEnabled(env: Env): boolean {
 // ---------------------------------------------------------------------------
 
 export interface CompressResult {
-  /** 压缩摘要文本，null 表示无需压缩 */
   summary: string | null;
-  /** 传给 assembler 的 messages（保留 system + 最近 user/assistant） */
   messages: OpenAIChatMessage[];
-  /** 压缩统计元数据 */
   meta: {
     original_count: number;
     compressed_count: number;
     kept_count: number;
     cache_hit: boolean;
     compress_boundary: number;
+    total_segments: number;
+    segments_computed: number;
   };
 }
 
 /**
- * 主入口：检查是否需要压缩，如需要则执行压缩并返回裁剪后的消息。
- *
- * 分段策略：
- *   windowSize = threshold - keepRecent (默认 25)
- *   compressEnd = floor((chatCount - keepRecent) / windowSize) * windowSize
- *   只在 compressEnd >= windowSize 时触发。
- *
- * 这样在同一个段内（约 25 轮请求），缓存持续命中。
+ * 主入口：检查阈值 → 级联压缩 → 返回裁剪后的消息。
  */
 export async function compressHistoryIfNeeded(
   env: Env,
@@ -89,7 +90,11 @@ export async function compressHistoryIfNeeded(
   const noopResult: CompressResult = {
     summary: null,
     messages,
-    meta: { original_count: 0, compressed_count: 0, kept_count: 0, cache_hit: false, compress_boundary: 0 },
+    meta: {
+      original_count: 0, compressed_count: 0, kept_count: 0,
+      cache_hit: false, compress_boundary: 0,
+      total_segments: 0, segments_computed: 0,
+    },
   };
 
   if (!isEnabled(env)) return noopResult;
@@ -111,41 +116,73 @@ export async function compressHistoryIfNeeded(
 
   if (compressEnd < windowSize) return noopResult;
 
-  const toCompress = chatMessages.slice(0, compressEnd);
   const recent = chatMessages.slice(compressEnd);
 
-  // D1 缓存查找
-  const cacheKey = `compress:${namespace}:boundary_${compressEnd}`;
-  let summary: string | null = null;
-  let cacheHit = false;
+  // -----------------------------------------------------------------------
+  // 级联压缩
+  // -----------------------------------------------------------------------
 
-  try {
-    const cached = await getCacheEntry(env.DB, { namespace, key: cacheKey });
-    if (cached) {
-      const value = parseCacheEntryValue(cached);
-      if (typeof value === "string" && value.trim()) {
-        summary = value;
-        cacheHit = true;
-      }
-    }
-  } catch {
-    // 缓存读取失败不阻断主流程
+  let summary: string | null = null;
+  let segmentsComputed = 0;
+  let cacheHit = true;
+
+  // 快路径：最终段缓存命中 → 直接返回
+  const finalKey = buildSegmentCacheKey(namespace, completeWindows, chatMessages, windowSize);
+  const finalCached = await tryGetCache(env.DB, namespace, finalKey);
+  if (finalCached) {
+    return {
+      summary: finalCached,
+      messages: [...systemMessages, ...recent],
+      meta: {
+        original_count: chatMessages.length,
+        compressed_count: compressEnd,
+        kept_count: recent.length,
+        cache_hit: true,
+        compress_boundary: compressEnd,
+        total_segments: completeWindows,
+        segments_computed: 0,
+      },
+    };
   }
 
-  if (!summary) {
+  // 慢路径：从后往前找最后一个缓存命中的段
+  let lastCachedSeg = 0;
+  let lastCachedSummary: string | null = null;
+
+  for (let seg = completeWindows - 1; seg >= 1; seg--) {
+    const key = buildSegmentCacheKey(namespace, seg, chatMessages, windowSize);
+    const cached = await tryGetCache(env.DB, namespace, key);
+    if (cached) {
+      lastCachedSeg = seg;
+      lastCachedSummary = cached;
+      break;
+    }
+  }
+
+  // 从 lastCachedSeg+1 开始级联压缩到 completeWindows
+  summary = lastCachedSummary;
+  cacheHit = false;
+
+  for (let seg = lastCachedSeg + 1; seg <= completeWindows; seg++) {
+    const segStart = (seg - 1) * windowSize;
+    const segEnd = seg * windowSize;
+    const segMessages = chatMessages.slice(segStart, segEnd);
+
     try {
-      summary = await callCompressModel(env, toCompress);
+      summary = await callCompressModel(env, segMessages, summary);
+      segmentsComputed++;
     } catch (error) {
-      // 压缩失败 → 降级为不压缩，原样通过
-      console.error("[compress] model call failed:", error);
-      return noopResult;
+      console.error(`[compress] segment ${seg} failed:`, error);
+      // 压缩失败 → 降级为不压缩
+      return { ...noopResult, meta: { ...noopResult.meta, original_count: chatMessages.length, kept_count: chatMessages.length } };
     }
 
-    // 异步写缓存
+    // 写缓存（非阻塞）
+    const key = buildSegmentCacheKey(namespace, seg, chatMessages, windowSize);
     try {
       await putCacheEntry(env.DB, {
         namespace,
-        key: cacheKey,
+        key,
         value: summary,
         tags: ["history_compression"],
         ttlSeconds: getCacheTtl(env),
@@ -160,12 +197,58 @@ export async function compressHistoryIfNeeded(
     messages: [...systemMessages, ...recent],
     meta: {
       original_count: chatMessages.length,
-      compressed_count: toCompress.length,
+      compressed_count: compressEnd,
       kept_count: recent.length,
       cache_hit: cacheHit,
       compress_boundary: compressEnd,
+      total_segments: completeWindows,
+      segments_computed: segmentsComputed,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// 缓存辅助
+// ---------------------------------------------------------------------------
+
+function simpleHash(text: string): string {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash << 5) + hash + text.charCodeAt(i)) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+/**
+ * 段缓存 key：含段号 + 首条消息指纹。
+ * 不同对话的同一段号内容不同，指纹不同，不会碰撞。
+ * 同一对话的同一段，消息不变，指纹不变，缓存命中。
+ */
+function buildSegmentCacheKey(
+  namespace: string,
+  segNum: number,
+  chatMessages: OpenAIChatMessage[],
+  windowSize: number
+): string {
+  const segStart = (segNum - 1) * windowSize;
+  const firstContent = contentToText(chatMessages[segStart]?.content).slice(0, 200);
+  const fp = simpleHash(firstContent);
+  return `compress:${namespace}:seg${segNum}_${fp}`;
+}
+
+async function tryGetCache(
+  db: D1Database,
+  namespace: string,
+  key: string
+): Promise<string | null> {
+  try {
+    const record = await getCacheEntry(db, { namespace, key });
+    if (!record) return null;
+    const value = parseCacheEntryValue(record);
+    return typeof value === "string" && value.trim() ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,25 +281,57 @@ function extractWorkersAiModel(model: string): string | null {
   return null;
 }
 
-async function callCompressModel(env: Env, messages: OpenAIChatMessage[]): Promise<string> {
+/**
+ * 调小模型做压缩。
+ *
+ * 级联模式：
+ *   - previousSummary = null → 首段，直接压缩消息
+ *   - previousSummary 存在  → 后续段，合并旧摘要 + 新消息
+ */
+async function callCompressModel(
+  env: Env,
+  messages: OpenAIChatMessage[],
+  previousSummary: string | null = null
+): Promise<string> {
   const model = getCompressModel(env);
   const maxChars = getMaxChars(env);
   const formatted = formatMessagesForCompression(messages);
 
-  const compressPrompt = [
-    "你是对话压缩助手。将以下对话历史压缩为简明摘要。",
-    "",
-    "要求：",
+  const requirements = [
     "1. 保留关键事实、决策、重要上下文",
     "2. 保留情感状态变化和关系动态",
     "3. 保留未完成的话题线索",
     "4. 丢弃重复内容、寒暄、已解决的问题",
     `5. 输出控制在${maxChars}字以内`,
     "6. 直接输出摘要文本，不要加任何前缀或标记",
-    "",
-    "对话历史：",
-    formatted,
   ].join("\n");
+
+  let compressPrompt: string;
+
+  if (previousSummary) {
+    compressPrompt = [
+      "你是对话压缩助手。将之前的对话摘要与新的对话片段合并，生成一份更新后的压缩摘要。",
+      "",
+      "要求：",
+      requirements,
+      "",
+      "之前的对话摘要：",
+      previousSummary,
+      "",
+      "新的对话片段：",
+      formatted,
+    ].join("\n");
+  } else {
+    compressPrompt = [
+      "你是对话压缩助手。将以下对话历史压缩为简明摘要。",
+      "",
+      "要求：",
+      requirements,
+      "",
+      "对话历史：",
+      formatted,
+    ].join("\n");
+  }
 
   const workersAiName = extractWorkersAiModel(model);
 
