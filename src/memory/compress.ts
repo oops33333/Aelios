@@ -309,37 +309,39 @@ async function callCompressModel(
   const formatted = formatMessagesForCompression(messages);
 
   const requirements = [
-    "1. 保留关键事实、决策、重要上下文",
-    "2. 保留情感状态变化和关系动态",
-    "3. 保留未完成的话题线索",
-    "4. 丢弃重复内容、寒暄、已解决的问题",
-    `5. 输出控制在${maxChars}字以内`,
-    "6. 直接输出摘要文本，不要加任何前缀或标记",
+    "1. Preserve key facts, decisions, and important context that would be needed to continue the conversation",
+    "2. Keep the summary in the same language as the original conversation",
+    `3. Target approximately ${maxChars} characters`,
+    "4. Output the summary directly without any explanations or meta-commentary",
+    "5. Format the summary as context information that can be used to continue the conversation",
+    "6. Use Chinese language",
+    "7. Preserve emotional dynamics, relationship context, and unfinished topics",
+    "8. Do NOT analyze or interpret the conversation like an academic paper; just summarize what happened",
   ].join("\n");
 
   let compressPrompt: string;
 
   if (previousSummary) {
     compressPrompt = [
-      "你是对话压缩助手。将之前的对话摘要与新的对话片段合并，生成一份更新后的压缩摘要。",
+      "You are a conversation compression assistant. Merge the previous summary with the new conversation segment into an updated concise summary.",
       "",
-      "要求：",
+      "Requirements:",
       requirements,
       "",
-      "之前的对话摘要：",
+      "Previous summary:",
       previousSummary,
       "",
-      "新的对话片段：",
+      "New conversation segment:",
       formatted,
     ].join("\n");
   } else {
     compressPrompt = [
-      "你是对话压缩助手。将以下对话历史压缩为简明摘要。",
+      "You are a conversation compression assistant. Compress the following conversation into a concise summary.",
       "",
-      "要求：",
+      "Requirements:",
       requirements,
       "",
-      "对话历史：",
+      "Conversation:",
       formatted,
     ].join("\n");
   }
