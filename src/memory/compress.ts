@@ -29,7 +29,7 @@ import type { Env, OpenAIChatMessage } from "../types";
 
 const DEFAULT_THRESHOLD = 30;
 const DEFAULT_KEEP_RECENT = 5;
-const DEFAULT_COMPRESS_MAX_CHARS = 800;
+const DEFAULT_COMPRESS_MAX_CHARS = 2000;
 const DEFAULT_CACHE_TTL = 86400;
 const DEFAULT_COMPRESS_MODEL = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
