@@ -143,7 +143,7 @@ function buildMergePrompt(input: { incoming: ExtractedMemory; candidates: Memory
     "",
     "规则：",
     "- 如果新记忆和旧记忆表达同一稳定事实/偏好且兼容，action=merge。",
-    "- 如果新记忆明确纠正旧记忆，例如“之前说错了”“不是 X 是 Y”“改成 Y”，action=supersede。",
+    "- 如果新记忆明确纠正旧记忆，例如\u201C之前说错了\u201D\u201C不是 X 是 Y\u201D\u201C改成 Y\u201D，action=supersede。",
     "- 如果不确定、只是主题相近、或会丢失细节，action=keep_both。",
     "- pinned=true 的候选记忆不能被 merge 或 supersede，只能 keep_both。",
     "- 不要添加输入里没有的新事实。",
