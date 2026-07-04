@@ -8,6 +8,7 @@ keep_vars = true
 crons = ["10 20 * * *"]
 
 [vars]
+CLOUDFLARE_API_TOKEN = ""
 PUBLIC_MODEL_NAME = "companion"
 ALLOW_MODEL_PASSTHROUGH = "true"
 

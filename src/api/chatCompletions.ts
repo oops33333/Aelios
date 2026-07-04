@@ -85,6 +85,8 @@ export async function handleChatCompletions(
     return openAiError("messages must be an array", 400);
   }
 
+  const isHeartbeat = request.headers.get("x-heartbeat") === "true";
+
   let targetModel: string;
   try {
     targetModel = resolveTargetModel(body.model, auth.profile, env);
@@ -100,21 +102,24 @@ export async function handleChatCompletions(
 
   const provider = classifyProvider(targetModel);
 
-  const conversation = await getOrCreateConversation(env.DB, {
+  const conversation = isHeartbeat ? null : await getOrCreateConversation(env.DB, {
     namespace: auth.profile.namespace
   });
 
-  const savedUserMessageIds = await saveUserMessages(env.DB, {
-    conversationId: conversation.id,
-    namespace: auth.profile.namespace,
-    source: auth.profile.source,
-    messages: body.messages,
-    requestModel: body.model,
-    upstreamModel: targetModel,
-    upstreamProvider: provider,
-    stream: Boolean(body.stream)
-  });
-  const latestUserMessageId = savedUserMessageIds[savedUserMessageIds.length - 1];
+  let latestUserMessageId: string | undefined;
+  if (!isHeartbeat) {
+    const savedUserMessageIds = await saveUserMessages(env.DB, {
+      conversationId: conversation!.id,
+      namespace: auth.profile.namespace,
+      source: auth.profile.source,
+      messages: body.messages,
+      requestModel: body.model,
+      upstreamModel: targetModel,
+      upstreamProvider: provider,
+      stream: Boolean(body.stream)
+    });
+    latestUserMessageId = savedUserMessageIds[savedUserMessageIds.length - 1];
+  }
 
   // History compression + memory search + persona + summary in parallel
   const userQuery = extractLastUserText(body.messages);
@@ -202,7 +207,7 @@ export async function handleChatCompletions(
         env,
         ctx,
         profile: auth.profile,
-        conversationId: conversation.id,
+        conversationId: conversation!.id,
         fromMessageId: latestUserMessageId,
         requestModel: body.model,
         upstreamModel: targetModel,
@@ -216,7 +221,7 @@ export async function handleChatCompletions(
       env,
       ctx,
       profile: auth.profile,
-      conversationId: conversation.id,
+      conversationId: conversation!.id,
       fromMessageId: latestUserMessageId,
       requestModel: body.model,
       upstreamModel: targetModel,
@@ -243,44 +248,46 @@ export async function handleChatCompletions(
     if (parsed.openai.choices?.[0]?.message) {
       parsed.openai.choices[0].message.content = filteredContent;
     }
-    const assistantMessageId = await saveAssistantMessage(env.DB, {
-      conversationId: conversation.id,
-      namespace: auth.profile.namespace,
-      source: auth.profile.source,
-      content: filteredContent,
-      requestModel: body.model,
-      upstreamModel: targetModel,
-      provider,
-      stream: false,
-      finishReason: parsed.finishReason,
-      usage: parsed.usage,
-      cacheMode: anthropicCacheMode,
-      cacheTtl: env.ANTHROPIC_CACHE_TTL || "5m"
-    });
+    if (!isHeartbeat) {
+      const assistantMessageId = await saveAssistantMessage(env.DB, {
+        conversationId: conversation!.id,
+        namespace: auth.profile.namespace,
+        source: auth.profile.source,
+        content: filteredContent,
+        requestModel: body.model,
+        upstreamModel: targetModel,
+        provider,
+        stream: false,
+        finishReason: parsed.finishReason,
+        usage: parsed.usage,
+        cacheMode: anthropicCacheMode,
+        cacheTtl: env.ANTHROPIC_CACHE_TTL || "5m"
+      });
 
-    ctx.waitUntil(
-      Promise.all([
-        saveUsageLog(env.DB, {
-          messageId: assistantMessageId,
-          namespace: auth.profile.namespace,
-          provider,
-          model: targetModel,
-          usage: parsed.usage,
-          cacheMode: anthropicCacheMode,
-          cacheTtl: env.ANTHROPIC_CACHE_TTL || "5m",
-          clientSystemHash,
-          cacheAnchorBlock
-        }),
-        enqueueMemoryMaintenanceIfNeeded(env, {
-          namespace: auth.profile.namespace,
-          conversationId: conversation.id,
-          fromMessageId: latestUserMessageId,
-          toMessageId: assistantMessageId,
-          source: auth.profile.source
-        }),
-        enqueueRetentionIfNeeded(env, auth.profile.namespace)
-      ])
-    );
+      ctx.waitUntil(
+        Promise.all([
+          saveUsageLog(env.DB, {
+            messageId: assistantMessageId,
+            namespace: auth.profile.namespace,
+            provider,
+            model: targetModel,
+            usage: parsed.usage,
+            cacheMode: anthropicCacheMode,
+            cacheTtl: env.ANTHROPIC_CACHE_TTL || "5m",
+            clientSystemHash,
+            cacheAnchorBlock
+          }),
+          enqueueMemoryMaintenanceIfNeeded(env, {
+            namespace: auth.profile.namespace,
+            conversationId: conversation!.id,
+            fromMessageId: latestUserMessageId!,
+            toMessageId: assistantMessageId,
+            source: auth.profile.source
+          }),
+          enqueueRetentionIfNeeded(env, auth.profile.namespace)
+        ])
+      );
+    }
 
     return new Response(JSON.stringify(parsed.openai), {
       status: 200,
@@ -303,40 +310,42 @@ export async function handleChatCompletions(
   if (parsed.choices?.[0]?.message) {
     parsed.choices[0].message.content = filteredContent;
   }
-  const assistantMessageId = await saveAssistantMessage(env.DB, {
-    conversationId: conversation.id,
-    namespace: auth.profile.namespace,
-    source: auth.profile.source,
-    content: filteredContent,
-    requestModel: body.model,
-    upstreamModel: targetModel,
-    provider,
-    stream: false,
-    finishReason: parsed.choices?.[0]?.finish_reason,
-    usage: parsed.usage
-  });
+  if (!isHeartbeat) {
+    const assistantMessageId = await saveAssistantMessage(env.DB, {
+      conversationId: conversation!.id,
+      namespace: auth.profile.namespace,
+      source: auth.profile.source,
+      content: filteredContent,
+      requestModel: body.model,
+      upstreamModel: targetModel,
+      provider,
+      stream: false,
+      finishReason: parsed.choices?.[0]?.finish_reason,
+      usage: parsed.usage
+    });
 
-  ctx.waitUntil(
-    Promise.all([
-      saveUsageLog(env.DB, {
-        messageId: assistantMessageId,
-        namespace: auth.profile.namespace,
-        provider,
-        model: targetModel,
-        usage: parsed.usage,
-        clientSystemHash,
-        cacheAnchorBlock
-      }),
-      enqueueMemoryMaintenanceIfNeeded(env, {
-        namespace: auth.profile.namespace,
-        conversationId: conversation.id,
-        fromMessageId: latestUserMessageId,
-        toMessageId: assistantMessageId,
-        source: auth.profile.source
-      }),
-      enqueueRetentionIfNeeded(env, auth.profile.namespace)
-    ])
-  );
+    ctx.waitUntil(
+      Promise.all([
+        saveUsageLog(env.DB, {
+          messageId: assistantMessageId,
+          namespace: auth.profile.namespace,
+          provider,
+          model: targetModel,
+          usage: parsed.usage,
+          clientSystemHash,
+          cacheAnchorBlock
+        }),
+        enqueueMemoryMaintenanceIfNeeded(env, {
+          namespace: auth.profile.namespace,
+          conversationId: conversation!.id,
+          fromMessageId: latestUserMessageId!,
+          toMessageId: assistantMessageId,
+          source: auth.profile.source
+        }),
+        enqueueRetentionIfNeeded(env, auth.profile.namespace)
+      ])
+    );
+  }
 
   return new Response(JSON.stringify(parsed), {
     status: 200,
