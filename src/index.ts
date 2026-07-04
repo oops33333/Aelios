@@ -52,6 +52,15 @@ export default {
       return handleModels(request, env);
     }
 
+    if (request.method === "GET" && url.pathname === "/v1/last-activity") {
+      const row = await env.DB.prepare(
+        "SELECT MAX(created_at) as last_at FROM messages WHERE namespace = 'default'"
+      ).first<{ last_at: string | null }>();
+      return new Response(JSON.stringify({ lastActivity: row?.last_at || null }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
       return handleChatCompletions(request, env, ctx);
     }
