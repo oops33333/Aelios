@@ -19,7 +19,7 @@ CHAT_MODEL = "deepseek/deepseek-v4-pro"
 # 记忆提取/整理用的模型（免费，省钱）
 SUMMARY_MODEL = "deepseek/deepseek-v4-flash:free"
 # 视觉模型
-VISION_MODEL = "google/gemini-2.5-flash-preview"
+VISION_MODEL = "@cf/google/gemini-3.5-flash"
 
 # ─── 记忆过滤（仍走 Workers AI，免费）───
 MEMORY_FILTER_MODEL = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"
