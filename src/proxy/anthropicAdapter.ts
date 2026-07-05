@@ -270,15 +270,11 @@ function applyRollingMessageCache(messages: AnthropicMessage[], env: Env): void 
   if (!cacheControl) return;
   if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "false") return;
 
-  const isFullWindow = messages.length >= getRollingCacheWindowSize(env);
-  const start = isFullWindow ? 0 : messages.length - 1;
-  const end = isFullWindow ? messages.length : -1;
-  const step = isFullWindow ? 1 : -1;
-
-  for (let i = start; i !== end; i += step) {
+  // BP3: 锚定最后一条 user message，最大化缓存覆盖。
+  // volatile/dynamic 内容在此之后追加，不进缓存前缀。
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
     if (message.role !== "user" || message.content.length === 0) continue;
-    // thinking 块不接受 cache_control，锚点落在最后一个可缓存块上
     for (let j = message.content.length - 1; j >= 0; j -= 1) {
       const block = message.content[j];
       if (block.type === "thinking") continue;
@@ -302,21 +298,29 @@ function appendUncachedUserContext(messages: AnthropicMessage[], text: string | 
   messages.push({ role: "user", content: [{ type: "text", text: trimmed }] });
 }
 
-function splitDynamicMemorySystemBlock(
+function splitDynamicSystemBlocks(
   assembled: AssembledPrompt
-): { systemBlocks: AssembledPrompt["system_blocks"]; dynamicMemoryPatch: string | null } {
-  const idx = assembled.meta.block_ids.indexOf("dynamic_memory_patch");
-  if (idx < 0 || idx >= assembled.system_blocks.length) {
-    return { systemBlocks: assembled.system_blocks, dynamicMemoryPatch: null };
+): {
+  systemBlocks: AssembledPrompt["system_blocks"];
+  volatileContext: string | null;
+  dynamicMemoryPatch: string | null;
+} {
+  const kept: AssembledPrompt["system_blocks"] = [];
+  let volatileContext: string | null = null;
+  let dynamicMemoryPatch: string | null = null;
+
+  for (let i = 0; i < assembled.system_blocks.length; i++) {
+    const blockId = assembled.meta.block_ids[i];
+    if (blockId === "client_volatile_context") {
+      volatileContext = assembled.system_blocks[i].text;
+    } else if (blockId === "dynamic_memory_patch") {
+      dynamicMemoryPatch = assembled.system_blocks[i].text;
+    } else {
+      kept.push(assembled.system_blocks[i]);
+    }
   }
 
-  return {
-    systemBlocks: [
-      ...assembled.system_blocks.slice(0, idx),
-      ...assembled.system_blocks.slice(idx + 1),
-    ],
-    dynamicMemoryPatch: assembled.system_blocks[idx].text,
-  };
+  return { systemBlocks: kept, volatileContext, dynamicMemoryPatch };
 }
 
 function getMaxTokens(req: OpenAIChatRequest): number {
@@ -566,10 +570,14 @@ export function getAnthropicUrlForModel(env: Env, targetModel: string): string {
 }
 
 export function buildAnthropicHeaders(env: Env): Headers {
+  const betaFeatures = ["prompt-caching-2024-07-31"];
+  if (env.ANTHROPIC_CACHE_TTL === "1h") {
+    betaFeatures.push("extended-cache-ttl-2025-04-11");
+  }
   const headers = new Headers({
     "content-type": "application/json",
     "anthropic-version": "2023-06-01",
-    "anthropic-beta": "prompt-caching-2024-07-31",
+    "anthropic-beta": betaFeatures.join(","),
     "cf-aig-skip-cache": "true",
   });
 
@@ -648,11 +656,12 @@ export function buildAnthropicRequestFromAssembled(
   env: Env
 ): AnthropicRequest {
   const thinking = buildThinkingConfig(env, req);
-  const { systemBlocks, dynamicMemoryPatch } = splitDynamicMemorySystemBlock(assembled);
+  const { systemBlocks, volatileContext, dynamicMemoryPatch } = splitDynamicSystemBlocks(assembled);
   const system = assembledToAnthropicSystem(systemBlocks);
   const messages = assembledToAnthropicMessages(assembled.messages);
   applyCacheOverrides(system, env);
   applyRollingMessageCache(messages, env);
+  appendUncachedUserContext(messages, volatileContext);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
 
   return {

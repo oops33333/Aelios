@@ -7,8 +7,8 @@
  */
 
 import type { AssembledPrompt } from "../assembler/types";
-import { assembledToOpenAIChatMessages } from "../assembler/toOpenAI";
-import type { Env, OpenAIChatRequest } from "../types";
+import { assembledToOpenAISystem, assembledToOpenAIMessages } from "../assembler/toOpenAI";
+import type { Env, OpenAIChatMessage, OpenAIChatRequest } from "../types";
 
 function stripClaudeNativeThinkingFields(req: OpenAIChatRequest): OpenAIChatRequest {
   const cleaned: OpenAIChatRequest = { ...req };
@@ -30,7 +30,34 @@ export function buildOpenAIRequestFromAssembled(
   targetModel: string,
   assembled: AssembledPrompt
 ): OpenAIChatRequest {
-  const messages = assembledToOpenAIChatMessages(assembled);
+  const stableBlocks: typeof assembled.system_blocks = [];
+  const dynamicTexts: string[] = [];
+
+  for (let i = 0; i < assembled.system_blocks.length; i++) {
+    const blockId = assembled.meta.block_ids[i];
+    if (blockId === "client_volatile_context" || blockId === "dynamic_memory_patch") {
+      dynamicTexts.push(assembled.system_blocks[i].text);
+    } else {
+      stableBlocks.push(assembled.system_blocks[i]);
+    }
+  }
+
+  const systemMsg = assembledToOpenAISystem(stableBlocks);
+  const messages: OpenAIChatMessage[] = [];
+  if (systemMsg) messages.push(systemMsg);
+  messages.push(...assembledToOpenAIMessages(assembled.messages));
+
+  if (dynamicTexts.length > 0) {
+    const extra = dynamicTexts.join("\n\n");
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        const current = messages[i].content;
+        messages[i].content = (typeof current === "string" ? current : "") + "\n\n" + extra;
+        break;
+      }
+    }
+  }
+
   return buildOpenAICompatRequest({ ...req, messages }, targetModel);
 }
 
