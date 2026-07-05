@@ -114,17 +114,15 @@ export async function handleChatCompletions(
         }
       } catch { /* continue without vision */ }
     }
-    if (provider !== "anthropic") {
-      body = {
-        ...body,
-        messages: body.messages.map(m => {
-          if (!Array.isArray(m.content)) return m;
-          const texts = (m.content as Array<Record<string, unknown>>).filter(p => p.type !== "image_url" && p.type !== "input_image");
-          if (texts.length === 1 && texts[0].type === "text") return { ...m, content: texts[0].text as string };
-          return { ...m, content: texts.length > 0 ? texts : "" };
-        }),
-      };
-    }
+    body = {
+      ...body,
+      messages: body.messages.map(m => {
+        if (!Array.isArray(m.content)) return m;
+        const texts = (m.content as Array<Record<string, unknown>>).filter(p => p.type !== "image_url" && p.type !== "input_image");
+        if (texts.length === 1 && texts[0].type === "text") return { ...m, content: texts[0].text as string };
+        return { ...m, content: texts.length > 0 ? texts : "" };
+      }),
+    };
   }
 
   const conversation = isHeartbeat ? null : await getOrCreateConversation(env.DB, {
