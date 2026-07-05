@@ -137,13 +137,16 @@ export async function handleChatCompletions(
       }),
     };
     if (visionOutput) {
-      body = {
-        ...body,
-        messages: [
-          { role: "system" as const, content: `<vision_context>\n用户发送了一张图片。以下是图片的描述：\n${visionOutput}\n</vision_context>` },
-          ...body.messages,
-        ],
-      };
+      const visionTag = `\n\n<vision_context>\n用户发送了一张图片。以下是图片的描述：\n${visionOutput}\n</vision_context>`;
+      const msgs = [...body.messages];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === "user") {
+          const cur = msgs[i].content;
+          msgs[i] = { ...msgs[i], content: (typeof cur === "string" ? cur : "") + visionTag };
+          break;
+        }
+      }
+      body = { ...body, messages: msgs };
     }
     console.log("[vision] visionOutput injecting:", visionOutput ? "yes" : "no");
   }
