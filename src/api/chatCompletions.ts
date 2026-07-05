@@ -136,6 +136,15 @@ export async function handleChatCompletions(
         return { ...m, content: texts.length > 0 ? texts : "" };
       }),
     };
+    if (visionOutput) {
+      body = {
+        ...body,
+        messages: [
+          { role: "system" as const, content: `<vision_context>\n用户发送了一张图片。以下是图片的描述：\n${visionOutput}\n</vision_context>` },
+          ...body.messages,
+        ],
+      };
+    }
     console.log("[vision] visionOutput injecting:", visionOutput ? "yes" : "no");
   }
 
@@ -195,7 +204,7 @@ export async function handleChatCompletions(
           pinnedPersonaMemories,
           summaryEntry,
           ragMemories: memories,
-          visionOutput,
+          visionOutput: null,
           compressedSummary,
         });
         clientSystemHash = assembled.meta.client_system_hash;
@@ -217,7 +226,7 @@ export async function handleChatCompletions(
           pinnedPersonaMemories,
           summaryEntry,
           ragMemories: memories,
-          visionOutput,
+          visionOutput: null,
           compressedSummary,
         });
         clientSystemHash = assembled.meta.client_system_hash;
