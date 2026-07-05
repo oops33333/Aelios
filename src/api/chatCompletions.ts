@@ -100,19 +100,32 @@ export async function handleChatCompletions(
   let visionOutput: string | null = null;
   if (hasImageContent(body) && env.VISION_MODEL) {
     const lastUserMsg = [...body.messages].reverse().find(m => m.role === "user");
-    if (lastUserMsg) {
-      try {
-        const visionRes = await callOpenAICompat(env, {
-          model: env.VISION_MODEL,
-          messages: [{ role: "user", content: lastUserMsg.content }],
-          max_tokens: 500,
-          stream: false,
-        } as OpenAIChatRequest);
-        if (visionRes.ok) {
-          const vd = await visionRes.json() as { choices?: Array<{ message?: { content?: string } }> };
-          visionOutput = vd?.choices?.[0]?.message?.content || null;
+    if (lastUserMsg && Array.isArray(lastUserMsg.content)) {
+      const imageParts = (lastUserMsg.content as Array<Record<string, unknown>>).filter(
+        p => p.type === "image_url" || p.type === "input_image"
+      );
+      if (imageParts.length > 0) {
+        try {
+          const visionRes = await callOpenAICompat(env, {
+            model: env.VISION_MODEL,
+            messages: [
+              { role: "system", content: "你是图片描述工具。如实、详细地描述图片中看到的所有内容：物体、人物、场景、文字、颜色、布局。只输出描述本身，不要加任何分析、解读、评论或开场白。" },
+              { role: "user", content: [{ type: "text", text: "请描述这张图片。" }, ...imageParts] },
+            ],
+            max_tokens: 500,
+            stream: false,
+          } as OpenAIChatRequest);
+          if (visionRes.ok) {
+            const vd = await visionRes.json() as { choices?: Array<{ message?: { content?: string } }> };
+            visionOutput = vd?.choices?.[0]?.message?.content || null;
+            console.log("[vision] output:", visionOutput ? visionOutput.slice(0, 80) + "..." : "empty");
+          } else {
+            console.log("[vision] error status:", visionRes.status, await visionRes.text().catch(() => ""));
+          }
+        } catch (e) {
+          console.log("[vision] exception:", e instanceof Error ? e.message : e);
         }
-      } catch { /* continue without vision */ }
+      }
     }
     body = {
       ...body,
@@ -123,6 +136,7 @@ export async function handleChatCompletions(
         return { ...m, content: texts.length > 0 ? texts : "" };
       }),
     };
+    console.log("[vision] visionOutput injecting:", visionOutput ? "yes" : "no");
   }
 
   const conversation = isHeartbeat ? null : await getOrCreateConversation(env.DB, {
