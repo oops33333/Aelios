@@ -117,8 +117,39 @@ export function buildOpenAICompatHeaders(env: Env, model?: string): Headers {
   return headers;
 }
 
+function isWorkersAiModel(model: string): string | null {
+  if (model.startsWith("@cf/")) return model;
+  if (model.startsWith("workers-ai/")) return model.slice("workers-ai/".length);
+  return null;
+}
+
 export async function callOpenAICompat(env: Env, body: OpenAIChatRequest): Promise<Response> {
   const model = body.model;
+  const waiModel = model ? isWorkersAiModel(model) : null;
+
+  if (waiModel && env.AI) {
+    try {
+      const result = await (env.AI as any).run(waiModel, {
+        messages: body.messages,
+        max_tokens: typeof body.max_tokens === "number" ? body.max_tokens : 1024,
+        temperature: typeof body.temperature === "number" ? body.temperature : undefined,
+      });
+      const text = typeof result?.response === "string" ? result.response : "";
+      return new Response(JSON.stringify({
+        id: "wai-" + Date.now(),
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: waiModel,
+        choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Workers AI error";
+      return new Response(JSON.stringify({ error: { message: msg, type: "workers_ai_error" } }), {
+        status: 502, headers: { "content-type": "application/json" },
+      });
+    }
+  }
+
   return fetch(getOpenAICompatUrl(env, model), {
     method: "POST",
     headers: buildOpenAICompatHeaders(env, model),
