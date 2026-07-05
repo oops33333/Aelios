@@ -95,6 +95,8 @@ export async function handleChatCompletions(
     return openAiError(message, 500);
   }
 
+  const provider = classifyProvider(targetModel);
+
   let visionOutput: string | null = null;
   if (hasImageContent(body) && env.VISION_MODEL) {
     const lastUserMsg = [...body.messages].reverse().find(m => m.role === "user");
@@ -112,18 +114,18 @@ export async function handleChatCompletions(
         }
       } catch { /* continue without vision */ }
     }
-    body = {
-      ...body,
-      messages: body.messages.map(m => {
-        if (!Array.isArray(m.content)) return m;
-        const texts = (m.content as Array<Record<string, unknown>>).filter(p => p.type !== "image_url" && p.type !== "input_image");
-        if (texts.length === 1 && texts[0].type === "text") return { ...m, content: texts[0].text as string };
-        return { ...m, content: texts.length > 0 ? texts : "" };
-      }),
-    };
+    if (provider !== "anthropic") {
+      body = {
+        ...body,
+        messages: body.messages.map(m => {
+          if (!Array.isArray(m.content)) return m;
+          const texts = (m.content as Array<Record<string, unknown>>).filter(p => p.type !== "image_url" && p.type !== "input_image");
+          if (texts.length === 1 && texts[0].type === "text") return { ...m, content: texts[0].text as string };
+          return { ...m, content: texts.length > 0 ? texts : "" };
+        }),
+      };
+    }
   }
-
-  const provider = classifyProvider(targetModel);
 
   const conversation = isHeartbeat ? null : await getOrCreateConversation(env.DB, {
     namespace: auth.profile.namespace
@@ -146,9 +148,10 @@ export async function handleChatCompletions(
 
   // History compression + memory search + persona + summary in parallel
   const userQuery = extractLastUserText(body.messages);
+  const memoryQuery = visionOutput ? `${userQuery}\n${visionOutput}`.slice(0, 500) : userQuery;
   const [compressResult, memories, pinnedPersonaMemories, latestSummary] = await Promise.all([
     compressHistoryIfNeeded(env, body.messages, auth.profile.namespace),
-    selectMemoriesForInjection(env, { profile: auth.profile, query: userQuery }),
+    selectMemoriesForInjection(env, { profile: auth.profile, query: memoryQuery }),
     fetchPinnedPersonaMemories(env, auth.profile.namespace),
     getLatestSummary(env.DB, auth.profile.namespace),
   ]);
