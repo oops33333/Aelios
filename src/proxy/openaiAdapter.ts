@@ -69,8 +69,10 @@ export function buildOpenAIRequestFromAssembled(
 
 function useOpenRouter(env: Env, model?: string): boolean {
   if (!env.OPENROUTER_API_KEY) return false;
-  if (model && model.toLowerCase().includes("deepseek")) return true;
-  return false;
+  if (!model) return false;
+  const lower = model.toLowerCase();
+  if (lower.startsWith("@cf/") || lower.startsWith("workers-ai/") || lower.startsWith("google/")) return false;
+  return true;
 }
 
 function getOpenRouterBaseUrl(env: Env): string {

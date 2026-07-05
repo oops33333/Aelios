@@ -95,9 +95,32 @@ export async function handleChatCompletions(
     return openAiError(message, 500);
   }
 
-  if (hasImageContent(body)) {
-    if (!env.VISION_MODEL) return openAiError("Missing VISION_MODEL", 500);
-    targetModel = env.VISION_MODEL;
+  let visionOutput: string | null = null;
+  if (hasImageContent(body) && env.VISION_MODEL) {
+    const lastUserMsg = [...body.messages].reverse().find(m => m.role === "user");
+    if (lastUserMsg) {
+      try {
+        const visionRes = await callOpenAICompat(env, {
+          model: env.VISION_MODEL,
+          messages: [{ role: "user", content: lastUserMsg.content }],
+          max_tokens: 500,
+          stream: false,
+        } as OpenAIChatRequest);
+        if (visionRes.ok) {
+          const vd = await visionRes.json() as { choices?: Array<{ message?: { content?: string } }> };
+          visionOutput = vd?.choices?.[0]?.message?.content || null;
+        }
+      } catch { /* continue without vision */ }
+    }
+    body = {
+      ...body,
+      messages: body.messages.map(m => {
+        if (!Array.isArray(m.content)) return m;
+        const texts = (m.content as Array<Record<string, unknown>>).filter(p => p.type !== "image_url" && p.type !== "input_image");
+        if (texts.length === 1 && texts[0].type === "text") return { ...m, content: texts[0].text as string };
+        return { ...m, content: texts.length > 0 ? texts : "" };
+      }),
+    };
   }
 
   const provider = classifyProvider(targetModel);
@@ -157,7 +180,7 @@ export async function handleChatCompletions(
           pinnedPersonaMemories,
           summaryEntry,
           ragMemories: memories,
-          visionOutput: null,
+          visionOutput,
           compressedSummary,
         });
         clientSystemHash = assembled.meta.client_system_hash;
@@ -179,7 +202,7 @@ export async function handleChatCompletions(
           pinnedPersonaMemories,
           summaryEntry,
           ragMemories: memories,
-          visionOutput: null,
+          visionOutput,
           compressedSummary,
         });
         clientSystemHash = assembled.meta.client_system_hash;
