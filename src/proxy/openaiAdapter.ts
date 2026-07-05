@@ -117,36 +117,108 @@ export function buildOpenAICompatHeaders(env: Env, model?: string): Headers {
   return headers;
 }
 
-function isWorkersAiModel(model: string): string | null {
+function getWorkersAiModel(model: string): string | null {
   if (model.startsWith("@cf/")) return model;
   if (model.startsWith("workers-ai/")) return model.slice("workers-ai/".length);
   return null;
 }
 
+function isGeminiModel(model: string): boolean {
+  const lower = model.toLowerCase();
+  return lower.startsWith("google/gemini") || lower.startsWith("gemini");
+}
+
+interface GeminiPart {
+  text?: string;
+  inline_data?: { mime_type: string; data: string };
+}
+
+function openAiMsgToGeminiContents(messages: Array<{ role: string; content: unknown }>): Array<{ role: string; parts: GeminiPart[] }> {
+  const contents: Array<{ role: string; parts: GeminiPart[] }> = [];
+  for (const m of messages) {
+    if (m.role !== "user" && m.role !== "assistant") continue;
+    const role = m.role === "assistant" ? "model" : "user";
+    const parts: GeminiPart[] = [];
+    if (typeof m.content === "string") {
+      parts.push({ text: m.content });
+    } else if (Array.isArray(m.content)) {
+      for (const p of m.content as Array<Record<string, unknown>>) {
+        if (p.type === "text" && typeof p.text === "string") {
+          parts.push({ text: p.text });
+        } else if (p.type === "image_url") {
+          const url = (p.image_url as Record<string, unknown>)?.url;
+          if (typeof url === "string" && url.startsWith("data:")) {
+            const sep = url.indexOf(";base64,");
+            if (sep > 5) {
+              parts.push({ inline_data: { mime_type: url.slice(5, sep), data: url.slice(sep + 8) } });
+            }
+          }
+        }
+      }
+    }
+    if (parts.length > 0) contents.push({ role, parts });
+  }
+  return contents;
+}
+
+function extractGeminiText(result: unknown): string {
+  if (!result || typeof result !== "object") return "";
+  const r = result as Record<string, unknown>;
+  if (typeof r.response === "string") return r.response;
+  const candidates = r.candidates;
+  if (Array.isArray(candidates) && candidates.length > 0) {
+    const c = candidates[0] as Record<string, unknown>;
+    const content = c?.content as Record<string, unknown> | undefined;
+    const parts = content?.parts;
+    if (Array.isArray(parts)) {
+      return parts.map((p: Record<string, unknown>) => typeof p.text === "string" ? p.text : "").join("");
+    }
+  }
+  return "";
+}
+
 export async function callOpenAICompat(env: Env, body: OpenAIChatRequest): Promise<Response> {
   const model = body.model;
-  const waiModel = model ? isWorkersAiModel(model) : null;
 
-  if (waiModel && env.AI) {
-    try {
-      const result = await (env.AI as any).run(waiModel, {
-        messages: body.messages,
-        max_tokens: typeof body.max_tokens === "number" ? body.max_tokens : 1024,
-        temperature: typeof body.temperature === "number" ? body.temperature : undefined,
-      });
-      const text = typeof result?.response === "string" ? result.response : "";
-      return new Response(JSON.stringify({
-        id: "wai-" + Date.now(),
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: waiModel,
-        choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-      }), { status: 200, headers: { "content-type": "application/json" } });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Workers AI error";
-      return new Response(JSON.stringify({ error: { message: msg, type: "workers_ai_error" } }), {
-        status: 502, headers: { "content-type": "application/json" },
-      });
+  if (model && env.AI) {
+    const waiModel = getWorkersAiModel(model);
+    if (waiModel) {
+      try {
+        const result = await (env.AI as any).run(waiModel, {
+          messages: body.messages,
+          max_tokens: typeof body.max_tokens === "number" ? body.max_tokens : 1024,
+          temperature: typeof body.temperature === "number" ? body.temperature : undefined,
+        });
+        const text = typeof result?.response === "string" ? result.response : "";
+        return new Response(JSON.stringify({
+          id: "wai-" + Date.now(), object: "chat.completion",
+          created: Math.floor(Date.now() / 1000), model: waiModel,
+          choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "Workers AI error";
+        return new Response(JSON.stringify({ error: { message: msg, type: "workers_ai_error" } }), {
+          status: 502, headers: { "content-type": "application/json" },
+        });
+      }
+    }
+
+    if (isGeminiModel(model)) {
+      try {
+        const contents = openAiMsgToGeminiContents(body.messages as Array<{ role: string; content: unknown }>);
+        const result = await (env.AI as any).run(model, { contents });
+        const text = extractGeminiText(result);
+        return new Response(JSON.stringify({
+          id: "wai-" + Date.now(), object: "chat.completion",
+          created: Math.floor(Date.now() / 1000), model,
+          choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "Workers AI error";
+        return new Response(JSON.stringify({ error: { message: msg, type: "workers_ai_error" } }), {
+          status: 502, headers: { "content-type": "application/json" },
+        });
+      }
     }
   }
 
