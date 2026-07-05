@@ -52,7 +52,11 @@ export function buildOpenAIRequestFromAssembled(
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === "user") {
         const current = messages[i].content;
-        messages[i].content = (typeof current === "string" ? current : "") + "\n\n" + extra;
+        if (Array.isArray(current)) {
+          (current as unknown[]).push({ type: "text", text: extra });
+        } else {
+          messages[i].content = (typeof current === "string" ? current : "") + "\n\n" + extra;
+        }
         break;
       }
     }
@@ -65,8 +69,10 @@ export function buildOpenAIRequestFromAssembled(
 
 function useOpenRouter(env: Env, model?: string): boolean {
   if (!env.OPENROUTER_API_KEY) return false;
-  if (model && model.toLowerCase().includes("deepseek")) return true;
-  return false;
+  if (!model) return true;
+  const lower = model.toLowerCase();
+  if (lower.startsWith("workers-ai/") || lower.startsWith("@cf/")) return false;
+  return true;
 }
 
 function getOpenRouterBaseUrl(env: Env): string {
