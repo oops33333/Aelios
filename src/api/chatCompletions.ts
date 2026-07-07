@@ -18,6 +18,7 @@ import {
   getAnthropicCacheMode,
   parseAnthropicNonStream
 } from "../proxy/anthropicAdapter";
+import { replayHeartbeatPrefix, storeHeartbeatPrefix } from "../proxy/heartbeatPrefix";
 import { buildOpenAICompatRequest, buildOpenAIRequestFromAssembled, callOpenAICompat } from "../proxy/openaiAdapter";
 import { classifyProvider, resolveTargetModel } from "../proxy/resolveModel";
 import { streamAnthropicToOpenAI } from "../proxy/streamAnthropic";
@@ -86,6 +87,31 @@ export async function handleChatCompletions(
   }
 
   const isHeartbeat = request.headers.get("x-heartbeat") === "true";
+
+  if (isHeartbeat) {
+    // 心跳不落库也不该走流式；防止下游 conversation!.id 空指针
+    body = { ...body, stream: false };
+
+    // 首选：重放最近一次真实请求的缓存前缀，逐字节命中并刷新全部断点 TTL。
+    // 无存储前缀（或上游失败）时回退到旧的 ping 组装路径。
+    const replayed = await replayHeartbeatPrefix(env, auth.profile.namespace);
+    if (replayed) {
+      if (replayed.ok) {
+        const parsed = parseAnthropicNonStream((await replayed.json()) as never);
+        console.log(
+          "[heartbeat] prefix replay ok, cache_read =",
+          parsed.usage?.cache_read_input_tokens ?? 0,
+          "cache_creation =",
+          parsed.usage?.cache_creation_input_tokens ?? 0
+        );
+        return new Response(JSON.stringify(parsed.openai), {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8" }
+        });
+      }
+      console.log("[heartbeat] prefix replay upstream error", replayed.status, await replayed.text().catch(() => ""));
+    }
+  }
 
   let targetModel: string;
   try {
@@ -200,6 +226,9 @@ export async function handleChatCompletions(
           namespace: auth.profile.namespace,
           memories
         });
+        if (!isHeartbeat) {
+          ctx.waitUntil(storeHeartbeatPrefix(env, auth.profile.namespace, targetModel, anthropicRequest));
+        }
         upstream = await callAnthropicNative(env, anthropicRequest, targetModel);
       } else {
         const assembled = assemble({
@@ -215,7 +244,11 @@ export async function handleChatCompletions(
         // NOTE: Anthropic adapter stringifies structured content (image_url etc.)
         // as a temporary fallback; native Anthropic image support will be added
         // when the vision pipeline is wired in.
-        upstream = await callAnthropicNative(env, buildAnthropicRequestFromAssembled(body, targetModel, assembled, env), targetModel);
+        const anthropicRequest = buildAnthropicRequestFromAssembled(body, targetModel, assembled, env);
+        if (!isHeartbeat) {
+          ctx.waitUntil(storeHeartbeatPrefix(env, auth.profile.namespace, targetModel, anthropicRequest));
+        }
+        upstream = await callAnthropicNative(env, anthropicRequest, targetModel);
       }
     } else {
       if (hasToolContent(body)) {

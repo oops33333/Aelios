@@ -59,7 +59,7 @@ type AnthropicToolChoice =
   | { type: "auto" | "any" | "none"; disable_parallel_tool_use?: boolean }
   | { type: "tool"; name: string; disable_parallel_tool_use?: boolean };
 
-interface AnthropicRequest {
+export interface AnthropicRequest {
   model: string;
   max_tokens: number;
   cache_control?: AnthropicCacheControl;
