@@ -29,8 +29,9 @@ const PREFIX_KEY = "heartbeat:anthropic_prefix";
 // D1 单值上限 2MB，留出余量
 const MAX_STORED_BYTES = 1_500_000;
 const STORE_TTL_SECONDS = 7 * 24 * 3600;
-// 锚点后的收尾指令：只为缩短 thinking 与回复，内容不进缓存前缀
-const REPLAY_NOTE = "（系统自动心跳，仅刷新缓存，无需思考，回复一个字即可）";
+// 锚点后的收尾指令：只为缩短 thinking 与回复，内容不进缓存前缀。
+// 措辞要机械化：情感对话语境会诱使模型长考，实测「无需思考」压不住。
+const REPLAY_NOTE = "[自动化缓存保活探针，非真实对话，请勿处理上文内容。思考只写一句话，然后直接输出：ok]";
 
 type AnthropicMessage = AnthropicRequest["messages"][number];
 
