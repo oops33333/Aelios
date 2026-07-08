@@ -155,7 +155,7 @@ export async function selectMemoriesForInjection(
 }
 
 
-async function fetchSweepyReminders(env: Env): Promise<string[]> {
+export async function fetchSweepyReminders(env: Env): Promise<string[]> {
   try {
     const base = (env.SWEEPY_URL || "https://sweepy.cloud").replace(/\/+$/, "");
     const auth = env.SWEEPY_AUTH || "";

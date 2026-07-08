@@ -5,7 +5,7 @@ import { listMemories } from "../db/memories";
 import { saveAssistantMessage, saveUserMessages } from "../db/messages";
 import { getLatestSummary } from "../db/summaries";
 import { saveUsageLog } from "../db/usageLogs";
-import { extractLastUserText, injectMemoryPatchAsSystemMessage, selectMemoriesForInjection } from "../memory/inject";
+import { extractLastUserText, fetchSweepyReminders, injectMemoryPatchAsSystemMessage, selectMemoriesForInjection } from "../memory/inject";
 import { compressHistoryIfNeeded } from "../memory/compress";
 import { toMemoryApiRecord } from "../memory/search";
 import { assemble } from "../assembler/assemble";
@@ -199,11 +199,13 @@ export async function handleChatCompletions(
   // History compression + memory search + persona + summary in parallel
   const userQuery = extractLastUserText(body.messages);
   const memoryQuery = visionOutput ? `${userQuery}\n${visionOutput}`.slice(0, 500) : userQuery;
-  const [compressResult, memories, pinnedPersonaMemories, latestSummary] = await Promise.all([
+  const userMsgCount = body.messages.filter((m) => m.role === "user").length;
+  const [compressResult, memories, pinnedPersonaMemories, latestSummary, reminders] = await Promise.all([
     compressHistoryIfNeeded(env, body.messages, auth.profile.namespace),
     selectMemoriesForInjection(env, { profile: auth.profile, query: memoryQuery }),
     fetchPinnedPersonaMemories(env, auth.profile.namespace),
     getLatestSummary(env.DB, auth.profile.namespace),
+    userMsgCount <= 1 ? fetchSweepyReminders(env) : Promise.resolve([]),
   ]);
 
   // If compression happened, use trimmed messages for the assembler
@@ -236,6 +238,7 @@ export async function handleChatCompletions(
           pinnedPersonaMemories,
           summaryEntry,
           ragMemories: memories,
+          reminders,
           visionOutput: null,
           compressedSummary,
         });
@@ -262,6 +265,7 @@ export async function handleChatCompletions(
           pinnedPersonaMemories,
           summaryEntry,
           ragMemories: memories,
+          reminders,
           visionOutput: null,
           compressedSummary,
         });

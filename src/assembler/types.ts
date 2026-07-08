@@ -49,6 +49,9 @@ export interface AssemblerContext {
   /** RAG hits for the current round. */
   ragMemories: MemoryApiRecord[];
 
+  /** Date reminders from sweepy (first round only). */
+  reminders: string[];
+
   /** Vision assistant output for the current round (image present, main model non-multimodal). */
   visionOutput: string | null;
 
@@ -95,6 +98,7 @@ export const BLOCK_ORDER: readonly string[] = [
   "compressed_summary",
   "client_volatile_context",
   "dynamic_memory_patch",
+  "reminders",
   "vision_context",
   "recent_history",
   "current_user",

@@ -320,6 +320,26 @@ const dynamicMemoryPatchBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
+// Block 6.5: reminders (dynamic)
+// Date reminders from sweepy, injected on first round only.
+// ---------------------------------------------------------------------------
+
+const remindersBlock: Block = {
+  id: "reminders",
+  kind: "dynamic",
+  role: "system",
+  cache_anchor: false,
+  content_fn: (ctx: AssemblerContext): string | null => {
+    if (!ctx.reminders || ctx.reminders.length === 0) return null;
+    return [
+      "<reminders>",
+      ...ctx.reminders,
+      "</reminders>",
+    ].join("\n");
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Block 7: vision_context (dynamic)
 // Vision assistant output; only when image present + main model non-multimodal.
 // ---------------------------------------------------------------------------
@@ -379,6 +399,7 @@ const BLOCK_MAP = new Map<string, Block>([
   [compressedSummaryBlock.id, compressedSummaryBlock],
   [clientVolatileContextBlock.id, clientVolatileContextBlock],
   [dynamicMemoryPatchBlock.id, dynamicMemoryPatchBlock],
+  [remindersBlock.id, remindersBlock],
   [visionContextBlock.id, visionContextBlock],
   [recentHistoryBlock.id, recentHistoryBlock],
   [currentUserBlock.id, currentUserBlock],

@@ -38,6 +38,9 @@ export interface AssembleInput {
   /** RAG hits for the current round. */
   ragMemories: MemoryApiRecord[];
 
+  /** Date reminders from sweepy (first round only). */
+  reminders?: string[];
+
   /** Vision assistant output (image present + main model non-multimodal). */
   visionOutput: string | null;
 
@@ -67,6 +70,7 @@ export function assemble(input: AssembleInput): AssembledPrompt {
     pinnedPersonaMemories: input.pinnedPersonaMemories,
     summaryEntry: input.summaryEntry,
     ragMemories: input.ragMemories,
+    reminders: input.reminders || [],
     visionOutput: input.visionOutput,
     compressedSummary: input.compressedSummary,
     historyMessages: extractHistoryMessages(request.messages),
