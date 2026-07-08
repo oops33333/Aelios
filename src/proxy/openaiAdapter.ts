@@ -35,7 +35,9 @@ export function buildOpenAIRequestFromAssembled(
 
   for (let i = 0; i < assembled.system_blocks.length; i++) {
     const blockId = assembled.meta.block_ids[i];
-    if (blockId === "client_volatile_context" || blockId === "dynamic_memory_patch") {
+    // Dynamic per-round blocks ride on the last user message instead of the
+    // system prefix, keeping the system message byte-stable for prefix caching.
+    if (blockId === "client_volatile_context" || blockId === "dynamic_memory_patch" || blockId === "reminders") {
       dynamicTexts.push(assembled.system_blocks[i].text);
     } else {
       stableBlocks.push(assembled.system_blocks[i]);

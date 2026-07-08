@@ -46,6 +46,7 @@ const BLOCK_ORDER = [
   "client_system",
   "client_volatile_context",
   "dynamic_memory_patch",
+  "reminders",
   "vision_context",
   "recent_history",
   "current_user",
@@ -227,6 +228,10 @@ function assemble(ctx) {
         );
         text = ["<memories>", ...lines, "</memories>"].join("\n");
       }
+    } else if (blockId === "reminders") {
+      if (ctx.reminders && ctx.reminders.length > 0) {
+        text = ["<reminders>", ...ctx.reminders, "</reminders>"].join("\n");
+      }
     } else if (blockId === "vision_context") {
       if (ctx.visionOutput) {
         text = `<vision_context>\n${ctx.visionOutput}\n</vision_context>`;
@@ -298,6 +303,7 @@ function makeBaseCtx() {
     ragMemories: [
       { type: "note", importance: 0.6, content: "用户喜欢猫" },
     ],
+    reminders: [],
     visionOutput: null,
     historyMessages: [
       { role: "user", content: "你好" },
@@ -473,7 +479,7 @@ check("stable blocks come before client_system, dynamic after", () => {
 
   const csPos = result.meta.block_ids.indexOf("client_system");
   const stableBefore = ["proxy_static_rules", "persona_pinned", "long_term_summary", "preset_lite"];
-  const dynamicAfter = ["dynamic_memory_patch", "vision_context"];
+  const dynamicAfter = ["dynamic_memory_patch", "reminders", "vision_context"];
 
   for (const id of stableBefore) {
     const pos = result.meta.block_ids.indexOf(id);
@@ -662,6 +668,52 @@ check("all-tool history produces no recent_history messages", () => {
   assert.strictEqual(result.messages.length, 1);
   assert.strictEqual(result.messages[0].role, "user");
   assert.ok(!result.meta.block_ids.includes("recent_history"));
+});
+
+// ---------------------------------------------------------------------------
+// Test 5.5: reminders block (dynamic, first round only)
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Test 5.5: reminders block ---");
+
+check("reminders present → block rendered with <reminders> tag, after dynamic_memory_patch", () => {
+  const ctx = makeBaseCtx();
+  ctx.reminders = ["[reminder] 糖糖的生日还有 3 天", "[reminder] 纪念日快到了"];
+  const result = assemble(ctx);
+
+  const remIdx = result.meta.block_ids.indexOf("reminders");
+  const dmIdx = result.meta.block_ids.indexOf("dynamic_memory_patch");
+  assert.ok(remIdx >= 0, "reminders block should be present");
+  assert.ok(dmIdx >= 0 && remIdx > dmIdx, "reminders should come after dynamic_memory_patch");
+  assert.strictEqual(
+    result.system_blocks[remIdx].text,
+    "<reminders>\n[reminder] 糖糖的生日还有 3 天\n[reminder] 纪念日快到了\n</reminders>"
+  );
+  assert.strictEqual(result.system_blocks[remIdx].cache_control, undefined);
+});
+
+check("empty reminders → block skipped", () => {
+  const ctx = makeBaseCtx();
+  ctx.reminders = [];
+  const result = assemble(ctx);
+  assert.ok(!result.meta.block_ids.includes("reminders"));
+});
+
+check("missing reminders field → block skipped (undefined tolerated)", () => {
+  const ctx = makeBaseCtx();
+  delete ctx.reminders;
+  const result = assemble(ctx);
+  assert.ok(!result.meta.block_ids.includes("reminders"));
+});
+
+check("reminders do not affect client_system_hash or anchor_index", () => {
+  const ctx1 = makeBaseCtx();
+  const ctx2 = makeBaseCtx();
+  ctx2.reminders = ["[reminder] 生日提醒"];
+  const a = assemble(ctx1);
+  const b = assemble(ctx2);
+  assert.strictEqual(a.meta.client_system_hash, b.meta.client_system_hash);
+  assert.strictEqual(a.meta.anchor_index, b.meta.anchor_index);
 });
 
 // ---------------------------------------------------------------------------

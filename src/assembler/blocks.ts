@@ -1,5 +1,5 @@
 /**
- * 10 block implementations for the v4 Prompt Assembler.
+ * Block implementations for the v4 Prompt Assembler (one per BLOCK_ORDER entry).
  *
  * Each block's content_fn must be deterministic: same ctx → same string.
  * No timestamps, no request ids, no Map iteration order.

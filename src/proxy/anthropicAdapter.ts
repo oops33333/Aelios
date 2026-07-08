@@ -2,7 +2,7 @@ import { buildStableMemoryPack } from "../memory/stablePack";
 import type { AssembledPrompt } from "../assembler/types";
 import { assembledToAnthropicMessages, assembledToAnthropicSystem } from "../assembler/toAnthropic";
 import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatResponse, TokenUsage } from "../types";
-import { formatMemoryPatch } from "../memory/inject";
+import { formatMemoryPatch, formatRemindersBlock } from "../memory/inject";
 import { normalizeAiGatewayBaseUrl } from "./openaiAdapter";
 
 interface AnthropicCacheControl {
@@ -343,10 +343,12 @@ function splitDynamicSystemBlocks(
   systemBlocks: AssembledPrompt["system_blocks"];
   volatileContext: string | null;
   dynamicMemoryPatch: string | null;
+  reminders: string | null;
 } {
   const kept: AssembledPrompt["system_blocks"] = [];
   let volatileContext: string | null = null;
   let dynamicMemoryPatch: string | null = null;
+  let reminders: string | null = null;
 
   for (let i = 0; i < assembled.system_blocks.length; i++) {
     const blockId = assembled.meta.block_ids[i];
@@ -354,12 +356,14 @@ function splitDynamicSystemBlocks(
       volatileContext = assembled.system_blocks[i].text;
     } else if (blockId === "dynamic_memory_patch") {
       dynamicMemoryPatch = assembled.system_blocks[i].text;
+    } else if (blockId === "reminders") {
+      reminders = assembled.system_blocks[i].text;
     } else {
       kept.push(assembled.system_blocks[i]);
     }
   }
 
-  return { systemBlocks: kept, volatileContext, dynamicMemoryPatch };
+  return { systemBlocks: kept, volatileContext, dynamicMemoryPatch, reminders };
 }
 
 function getMaxTokens(req: OpenAIChatRequest): number {
@@ -629,7 +633,14 @@ export function buildAnthropicHeaders(env: Env): Headers {
 
 export async function buildAnthropicNativeRequest(
   req: OpenAIChatRequest,
-  input: { env: Env; targetModel: string; namespace: string; memories: MemoryApiRecord[] }
+  input: {
+    env: Env;
+    targetModel: string;
+    namespace: string;
+    memories: MemoryApiRecord[];
+    /** Date reminders from sweepy (first round only); appended after the cache anchor. */
+    reminders?: string[];
+  }
 ): Promise<AnthropicRequest> {
   const stableMemoryPack = await buildStableMemoryPack(input.env, input.namespace);
   const stableBlock: AnthropicTextBlock = {
@@ -661,6 +672,7 @@ export async function buildAnthropicNativeRequest(
     : buildThinkingConfig(input.env, req);
   applyRollingMessageCache(messages, input.env);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
+  appendUncachedUserContext(messages, formatRemindersBlock(input.reminders || []));
   appendUncachedUserContext(messages, buildTimeContext());
 
   return {
@@ -683,8 +695,9 @@ export async function buildAnthropicNativeRequest(
  * - System blocks are converted via assembledToAnthropicSystem
  * - Messages via assembledToAnthropicMessages
  *   (structured content like image_url is JSON.stringify'd — temporary fallback)
- * - dynamic_memory_patch is moved out of system and appended after the
- *   rolling cache point, so changing RAG hits do not poison cached prefixes
+ * - dynamic_memory_patch and reminders are moved out of system and appended
+ *   after the rolling cache point, so per-round dynamic content does not
+ *   poison cached prefixes
  * - cache_control is applied to the client_system anchor block and the
  *   rolling user/window block, respecting ANTHROPIC_CACHE_ENABLED and
  *   ANTHROPIC_CACHE_TTL
@@ -696,13 +709,14 @@ export function buildAnthropicRequestFromAssembled(
   env: Env
 ): AnthropicRequest {
   const thinking = buildThinkingConfig(env, req);
-  const { systemBlocks, volatileContext, dynamicMemoryPatch } = splitDynamicSystemBlocks(assembled);
+  const { systemBlocks, volatileContext, dynamicMemoryPatch, reminders } = splitDynamicSystemBlocks(assembled);
   const system = assembledToAnthropicSystem(systemBlocks);
   const messages = assembledToAnthropicMessages(assembled.messages);
   applyCacheOverrides(system, env);
   applyRollingMessageCache(messages, env);
   appendUncachedUserContext(messages, volatileContext);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
+  appendUncachedUserContext(messages, reminders);
   appendUncachedUserContext(messages, buildTimeContext());
 
   return {

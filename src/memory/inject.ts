@@ -173,6 +173,16 @@ export async function fetchSweepyReminders(env: Env): Promise<string[]> {
   }
 }
 
+/**
+ * Format reminder lines into the <reminders> tag block.
+ * Shared by the v4 assembler fallback paths; the assembler's own
+ * remindersBlock keeps an inline copy (blocks.ts stays self-contained).
+ */
+export function formatRemindersBlock(reminders: string[]): string {
+  if (reminders.length === 0) return "";
+  return ["<reminders>", ...reminders, "</reminders>"].join("\n");
+}
+
 export function formatMemoryPatch(memories: MemoryApiRecord[]): string {
   if (memories.length === 0) return "";
 
@@ -199,17 +209,20 @@ export function formatMemoryPatch(memories: MemoryApiRecord[]): string {
 export async function injectMemoryPatchAsSystemMessage(
   request: OpenAIChatRequest,
   memories: MemoryApiRecord[],
-  env?: Env
+  env?: Env,
+  prefetchedReminders?: string[]
 ): Promise<OpenAIChatRequest> {
   let patch = formatMemoryPatch(memories);
 
-  // Fetch and append date reminders from sweepy (first round only)
+  // Append date reminders from sweepy (first round only). Callers that
+  // already fetched them in parallel pass prefetchedReminders to avoid
+  // a duplicate network round-trip.
   const userMsgCount = request.messages.filter((m) => m.role === "user").length;
-  if (env && userMsgCount <= 1) {
-    const reminders = await fetchSweepyReminders(env);
-    if (reminders.length > 0) {
-      const reminderBlock = "\n\n<reminders>\n" + reminders.join("\n") + "\n</reminders>";
-      patch = patch ? patch + reminderBlock : reminderBlock;
+  if (userMsgCount <= 1) {
+    const reminders = prefetchedReminders ?? (env ? await fetchSweepyReminders(env) : []);
+    const reminderBlock = formatRemindersBlock(reminders);
+    if (reminderBlock) {
+      patch = patch ? patch + "\n\n" + reminderBlock : reminderBlock;
     }
   }
 

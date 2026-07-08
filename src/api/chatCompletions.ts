@@ -226,7 +226,8 @@ export async function handleChatCompletions(
           env,
           targetModel,
           namespace: auth.profile.namespace,
-          memories
+          memories,
+          reminders
         });
         if (!isHeartbeat) {
           ctx.waitUntil(storeHeartbeatPrefix(env, auth.profile.namespace, targetModel, anthropicRequest));
@@ -256,7 +257,7 @@ export async function handleChatCompletions(
     } else {
       if (hasToolContent(body)) {
         // Tool messages / tool_calls not yet supported by assembler — fall back
-        const patchedBody = await injectMemoryPatchAsSystemMessage(body, memories, env);
+        const patchedBody = await injectMemoryPatchAsSystemMessage(body, memories, env, reminders);
         const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel);
         upstream = await callOpenAICompat(env, upstreamRequest);
       } else {

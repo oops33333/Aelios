@@ -86,7 +86,7 @@ export interface AssembledPrompt {
 }
 
 // ---------------------------------------------------------------------------
-// Global block order (10 blocks, single sequence, no PACK)
+// Global block order (single sequence, no PACK)
 // ---------------------------------------------------------------------------
 
 export const BLOCK_ORDER: readonly string[] = [
