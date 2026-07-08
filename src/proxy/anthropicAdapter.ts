@@ -144,15 +144,55 @@ function extractSignedThinkingBlocks(message: OpenAIChatMessage): AnthropicThink
     .map((block) => ({ type: "thinking", thinking: block.thinking!, signature: block.signature! }));
 }
 
+/**
+ * 工具描述里的动态日期行（如 rikkahub memory_tool 的 "Today is 2026年7月8日."）
+ * 每天变一次字节，而 tools 位于缓存前缀最前端 → 每天零点全量缓存失效。
+ * 转发前按行剥掉，日期经 formatToolDateContext 挂到缓存锚点之后
+ * （volatile，不进前缀，心跳存储时同样被截掉），模型仍知道当天日期。
+ * 仅匹配行首，避免误伤 "use get_time_info ..." 之类的正文。
+ */
+const TOOL_DATE_LINE = /^\s*(?:Today(?:'s date)?\s+is\b|今天是|今日是|本日是|当前日期|Current date\b)/i;
+
+function stripToolDateLines(description: string): string {
+  return description
+    .split("\n")
+    .filter((line) => !TOOL_DATE_LINE.test(line))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractToolDateLines(req: OpenAIChatRequest): string | null {
+  const tools = req.tools;
+  if (!Array.isArray(tools)) return null;
+  const lines: string[] = [];
+  for (const tool of tools as Array<{ function?: { description?: string } }>) {
+    const description = tool?.function?.description;
+    if (typeof description !== "string") continue;
+    for (const line of description.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed && TOOL_DATE_LINE.test(trimmed) && !lines.includes(trimmed)) lines.push(trimmed);
+    }
+  }
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+function formatToolDateContext(req: OpenAIChatRequest): string | null {
+  const lines = extractToolDateLines(req);
+  if (!lines) return null;
+  return "以下是客户端工具描述中提供的当前日期（为保持缓存前缀稳定移至此处），只用于当前回复：\n" + lines;
+}
+
 export function convertOpenAITools(req: OpenAIChatRequest): AnthropicTool[] | undefined {
   const tools = req.tools;
   if (!Array.isArray(tools) || tools.length === 0) return undefined;
   const converted: AnthropicTool[] = [];
   for (const tool of tools as Array<{ type?: string; function?: { name?: string; description?: string; parameters?: unknown } }>) {
     if (tool?.type !== "function" || !tool.function?.name) continue;
+    const description = tool.function.description ? stripToolDateLines(tool.function.description) : undefined;
     converted.push({
       name: tool.function.name,
-      ...(tool.function.description ? { description: tool.function.description } : {}),
+      ...(description ? { description } : {}),
       input_schema: isRecord(tool.function.parameters)
         ? (tool.function.parameters as Record<string, unknown>)
         : { type: "object", properties: {} }
@@ -622,6 +662,7 @@ export async function buildAnthropicNativeRequest(
     : buildThinkingConfig(input.env, req);
   applyRollingMessageCache(messages, input.env);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
+  appendUncachedUserContext(messages, formatToolDateContext(req));
 
   return {
     model: stripAnthropicModelPrefix(input.targetModel),
@@ -663,6 +704,7 @@ export function buildAnthropicRequestFromAssembled(
   applyRollingMessageCache(messages, env);
   appendUncachedUserContext(messages, volatileContext);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
+  appendUncachedUserContext(messages, formatToolDateContext(req));
 
   return {
     model: stripAnthropicModelPrefix(targetModel),
