@@ -25,7 +25,7 @@ import { streamAnthropicToOpenAI } from "../proxy/streamAnthropic";
 import { streamOpenAIWithTee } from "../proxy/streamOpenAI";
 import { CONTENT_RULES } from "../preset/regexRules";
 import { applyRegexRules } from "../preset/regexPipeline";
-import type { Env, MemoryApiRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
+import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { openAiError } from "../utils/json";
 import { hasImageContent } from "../utils/messages";
 
@@ -42,6 +42,35 @@ export function hasToolContent(body: OpenAIChatRequest): boolean {
   return body.messages.some(
     (m) => m.role === "tool" || (m.role === "assistant" && m.tool_calls != null)
   );
+}
+
+/**
+ * 将压缩摘要注入消息区头部（回退路径用）。以 user 消息承载而非 system 块，
+ * 使其落在滚动缓存前缀内（摘要只在压缩边界跳变时才变化，缓存读按一折计费）；
+ * 与首条 user 消息合并以保持角色交替合法。
+ */
+function injectCompressedSummary(
+  messages: OpenAIChatMessage[],
+  summary: string
+): OpenAIChatMessage[] {
+  const text = `<conversation_summary>\n以下是本次对话较早部分的摘要，更早的原文已省略：\n${summary}\n</conversation_summary>`;
+  const result = [...messages];
+  const first = result.findIndex((m) => m.role !== "system");
+  if (first === -1) {
+    result.push({ role: "user", content: text });
+    return result;
+  }
+  const msg = result[first];
+  if (msg.role !== "user") {
+    result.splice(first, 0, { role: "user", content: text });
+  } else if (typeof msg.content === "string") {
+    result[first] = { ...msg, content: `${text}\n\n${msg.content}` };
+  } else if (Array.isArray(msg.content)) {
+    result[first] = { ...msg, content: [{ type: "text", text }, ...msg.content] } as OpenAIChatMessage;
+  } else {
+    result[first] = { ...msg, content: text };
+  }
+  return result;
 }
 
 /**
@@ -213,6 +242,11 @@ export async function handleChatCompletions(
     ? { ...body, messages: compressResult.messages }
     : body;
   const compressedSummary = compressResult.summary;
+  // 回退路径（历史含 tool 消息时）同样必须吃到压缩结果，否则完整历史原样上行；
+  // 摘要注入消息区头部而非 system，见 injectCompressedSummary。
+  const fallbackBody = compressedSummary
+    ? { ...assemblerBody, messages: injectCompressedSummary(assemblerBody.messages, compressedSummary) }
+    : assemblerBody;
   const summaryEntry = latestSummary ? { content: latestSummary.content } : null;
 
   let upstream: Response;
@@ -220,9 +254,9 @@ export async function handleChatCompletions(
   let cacheAnchorBlock: string | null = null;
   try {
     if (provider === "anthropic") {
-      if (hasToolContent(body)) {
+      if (hasToolContent(assemblerBody)) {
         // Tool messages / tool_calls not yet supported by assembler — fall back
-        const anthropicRequest = await buildAnthropicNativeRequest(body, {
+        const anthropicRequest = await buildAnthropicNativeRequest(fallbackBody, {
           env,
           targetModel,
           namespace: auth.profile.namespace,
@@ -255,9 +289,9 @@ export async function handleChatCompletions(
         upstream = await callAnthropicNative(env, anthropicRequest, targetModel);
       }
     } else {
-      if (hasToolContent(body)) {
+      if (hasToolContent(assemblerBody)) {
         // Tool messages / tool_calls not yet supported by assembler — fall back
-        const patchedBody = await injectMemoryPatchAsSystemMessage(body, memories, env, reminders);
+        const patchedBody = await injectMemoryPatchAsSystemMessage(fallbackBody, memories, env, reminders);
         const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel);
         upstream = await callOpenAICompat(env, upstreamRequest);
       } else {

@@ -124,7 +124,11 @@ export async function compressHistoryIfNeeded(
 
   if (compressEnd < windowSize) return noopResult;
 
-  const recent = chatMessages.slice(compressEnd);
+  // recent 从原始数组切片：保留窗口内 tool 消息及其与 assistant tool_calls 的配对。
+  // chatMessages[compressEnd] 必为 user/assistant；其之前的 tool 结果属于更早的
+  // assistant（随摘要一并丢弃），因此切片内不会出现孤儿 tool_result。
+  const origStart = messages.indexOf(chatMessages[compressEnd]);
+  const recent = messages.slice(origStart).filter(m => m.role !== "system");
 
   // -----------------------------------------------------------------------
   // 级联压缩

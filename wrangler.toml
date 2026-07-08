@@ -53,6 +53,14 @@ DAILY_DIGEST_MAX_RUNS = "3"
 DAILY_DIGEST_MAX_TOKENS = "5000"
 ENABLE_DAILY_SUMMARY_MEMORY = "false"
 
+# ─── 对话历史压缩 ───
+# 此前从未启用：开关只存在于 src/memory/compress.ts，wrangler.toml/dashboard 均未设置，
+# 导致历史无限累积（2026-07 排查：缓存前缀单窗口涨到 69k tokens）。
+ENABLE_HISTORY_COMPRESSION = "true"
+# 摘要目标字数。硬上限是代码里的 max_tokens: 2000，中文 2000 字会超出被截断，
+# 故设 1200 字（约 1500-1800 tokens）留出余量。
+HISTORY_COMPRESS_MAX_CHARS = "1200"
+
 # ─── Anthropic 缓存 ───
 ANTHROPIC_THINKING_ENABLED = ""
 ANTHROPIC_THINKING_BUDGET = "1024"
@@ -67,6 +75,13 @@ CUSTOM_ANTHROPIC_MESSAGES_PATH = "messages"
 # SWEEPY_AUTH = "SET_IN_DASHBOARD"
 # CHATBOX_API_KEY, MEMORY_MCP_API_KEY, GUIDE_DOG_API_KEY
 # AI_GATEWAY_BASE_URL（如果 MEMORY_FILTER_MODEL 需要 Workers AI）
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
 [ai]
 binding = "AI"
 
