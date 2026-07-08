@@ -147,8 +147,8 @@ function extractSignedThinkingBlocks(message: OpenAIChatMessage): AnthropicThink
 /**
  * 工具描述里的动态日期行（如 rikkahub memory_tool 的 "Today is 2026年7月8日."）
  * 每天变一次字节，而 tools 位于缓存前缀最前端 → 每天零点全量缓存失效。
- * 转发前按行剥掉，日期经 formatToolDateContext 挂到缓存锚点之后
- * （volatile，不进前缀，心跳存储时同样被截掉），模型仍知道当天日期。
+ * 转发前按行剥掉；当前时间改由网关经 buildTimeContext 统一注入缓存锚点
+ * 之后（volatile，不进前缀，心跳存储时同样被截掉）。
  * 仅匹配行首，避免误伤 "use get_time_info ..." 之类的正文。
  */
 const TOOL_DATE_LINE = /^\s*(?:Today(?:'s date)?\s+is\b|今天是|今日是|本日是|当前日期|Current date\b)/i;
@@ -162,25 +162,24 @@ function stripToolDateLines(description: string): string {
     .trim();
 }
 
-function extractToolDateLines(req: OpenAIChatRequest): string | null {
-  const tools = req.tools;
-  if (!Array.isArray(tools)) return null;
-  const lines: string[] = [];
-  for (const tool of tools as Array<{ function?: { description?: string } }>) {
-    const description = tool?.function?.description;
-    if (typeof description !== "string") continue;
-    for (const line of description.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed && TOOL_DATE_LINE.test(trimmed) && !lines.includes(trimmed)) lines.push(trimmed);
-    }
-  }
-  return lines.length > 0 ? lines.join("\n") : null;
-}
+/**
+ * 网关注入的权威当前时间。始终追加在最后一个缓存锚点之后：
+ * 每轮字节都在变也不影响任何缓存前缀命中，且不会进入心跳存储的前缀。
+ */
+const TIME_CONTEXT_ZONE = "Asia/Shanghai";
 
-function formatToolDateContext(req: OpenAIChatRequest): string | null {
-  const lines = extractToolDateLines(req);
-  if (!lines) return null;
-  return "以下是客户端工具描述中提供的当前日期（为保持缓存前缀稳定移至此处），只用于当前回复：\n" + lines;
+function buildTimeContext(): string {
+  const formatted = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: TIME_CONTEXT_ZONE,
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    weekday: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(new Date());
+  return "以下是网关提供的当前时间，只用于当前回复，不要当作长期设定：\n当前时间：" + formatted + "（北京时间）";
 }
 
 export function convertOpenAITools(req: OpenAIChatRequest): AnthropicTool[] | undefined {
@@ -662,7 +661,7 @@ export async function buildAnthropicNativeRequest(
     : buildThinkingConfig(input.env, req);
   applyRollingMessageCache(messages, input.env);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
-  appendUncachedUserContext(messages, formatToolDateContext(req));
+  appendUncachedUserContext(messages, buildTimeContext());
 
   return {
     model: stripAnthropicModelPrefix(input.targetModel),
@@ -704,7 +703,7 @@ export function buildAnthropicRequestFromAssembled(
   applyRollingMessageCache(messages, env);
   appendUncachedUserContext(messages, volatileContext);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
-  appendUncachedUserContext(messages, formatToolDateContext(req));
+  appendUncachedUserContext(messages, buildTimeContext());
 
   return {
     model: stripAnthropicModelPrefix(targetModel),
