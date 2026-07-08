@@ -7,6 +7,7 @@ import { handleGuideDogChatCompletions } from "./api/guideDog";
 import { handleIngestMessagesApi, handleMemories, handleSearchMemoriesApi } from "./api/memories";
 import { handleMcp } from "./api/mcp";
 import { handleModels } from "./api/models";
+import { handleUsage } from "./api/usage";
 import { runDailyMemoryDigest } from "./memory/dailyDigest";
 import { runMemoryRetention } from "./memory/retention";
 import { handleQueueMessage } from "./queue/consumer";
@@ -50,6 +51,10 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/v1/models") {
       return handleModels(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/usage") {
+      return handleUsage(request, env);
     }
 
     if (request.method === "GET" && url.pathname === "/v1/last-activity") {
