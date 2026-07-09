@@ -53,7 +53,7 @@ function injectCompressedSummary(
   messages: OpenAIChatMessage[],
   summary: string
 ): OpenAIChatMessage[] {
-  const text = `<conversation_summary>\n以下是本次对话较早部分的摘要，更早的原文已省略：\n${summary}\n</conversation_summary>`;
+  const text = `<conversation_summary>\n以下是本次对话较早部分的第三人称档案摘要，更早的原文已省略。摘要仅供回忆事实与脉络；对话的语气、称呼与情感状态以其后的近期消息原文为准，不要模仿摘要的记录口吻：\n${summary}\n</conversation_summary>`;
   const result = [...messages];
   const first = result.findIndex((m) => m.role !== "system");
   if (first === -1) {

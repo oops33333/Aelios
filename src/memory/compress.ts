@@ -235,10 +235,13 @@ function simpleHash(text: string): string {
 }
 
 /**
- * 段缓存 key：含段号 + 首条消息指纹。
+ * 段缓存 key：含 prompt 版本 + 段号 + 首条消息指纹。
  * 不同对话的同一段号内容不同，指纹不同，不会碰撞。
  * 同一对话的同一段，消息不变，指纹不变，缓存命中。
+ * 压缩 prompt 改动时递增版本号，强制全量重压缩，避免旧风格摘要经缓存沿用。
  */
+const COMPRESS_PROMPT_VERSION = 2;
+
 function buildSegmentCacheKey(
   namespace: string,
   segNum: number,
@@ -248,7 +251,7 @@ function buildSegmentCacheKey(
   const segStart = (segNum - 1) * windowSize;
   const firstContent = contentToText(chatMessages[segStart]?.content).slice(0, 200);
   const fp = simpleHash(firstContent);
-  return `compress:${namespace}:seg${segNum}_${fp}`;
+  return `compress:${namespace}:v${COMPRESS_PROMPT_VERSION}:seg${segNum}_${fp}`;
 }
 
 async function tryGetCache(
@@ -312,21 +315,26 @@ async function callCompressModel(
   const maxChars = getMaxChars(env);
   const formatted = formatMessagesForCompression(messages);
 
+  const stance = [
+    "你是对话档案员，不是对话的参与者。你的任务是把对话记录压缩成第三人称的档案摘要，供后续对话作为背景参考。",
+    "铁律：全程以第三人称旁述（\"用户……\"\"助手……\"），禁止模仿、续写或代入任何一方的口吻，禁止使用第一人称。",
+  ].join("\n");
+
   const requirements = [
     `1. 用中文输出，目标 ${maxChars} 字以内`,
-    "2. 保留：关键事实、做出的决定、未完成的话题、情绪状态变化、亲密互动的情感脉络",
-    "3. 保留彼此使用的称呼和语气特征",
-    "4. 只写摘要本身，不加任何解释、分析或元评论",
-    "5. 写成可以直接续接对话的上下文，不是旁观者的总结报告",
-    "6. 不要用学术化口吻解读对话，记录发生了什么、感受是什么",
-    "7. 丢弃心跳探测消息（仅含 'ping' 或类似无实质内容的对话轮次），不将其纳入摘要",
+    "2. 事实优先：保留关键事实、数据、做出的决定、达成的约定、未完成的话题与待办事项",
+    "3. 情绪与关系动态同样是事实，用陈述句记录（如\"用户对某事感到不安，助手予以安抚\"），记录其存在与走向即可，不要渲染、不要重演",
+    "4. 双方使用的称呼、约定的说法作为事实记录（如\"助手称用户为某某\"），你自己不要使用这些称呼",
+    "5. 只写摘要本身，不加任何解释、评价或元说明",
+    "6. 丢弃心跳探测消息（仅含 'ping' 或类似无实质内容的对话轮次），不将其纳入摘要",
   ].join("\n");
 
   let compressPrompt: string;
 
   if (previousSummary) {
     compressPrompt = [
-      "你是对话压缩器。把旧摘要和新对话段合并成一份更新的摘要，让读到这份摘要的人能无缝接续对话。",
+      stance,
+      "把旧摘要与新对话段合并为一份更新的档案摘要。若旧摘要中存在第一人称或角色口吻，一并改写为第三人称。",
       "",
       "要求：",
       requirements,
@@ -339,7 +347,7 @@ async function callCompressModel(
     ].join("\n");
   } else {
     compressPrompt = [
-      "你是对话压缩器。把以下对话压缩成一份简洁摘要，让读到这份摘要的人能无缝接续对话。",
+      stance,
       "",
       "要求：",
       requirements,
