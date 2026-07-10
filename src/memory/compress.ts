@@ -403,6 +403,10 @@ async function callCompressModel(
     max_tokens: maxTokens,
     temperature: 0.3,
     stream: false,
+    // qwen3.7-plus 默认开思考链，reasoning tokens 挤占 max_tokens 预算；
+    // OpenRouter 统一 reasoning 参数关闭，enable_thinking 兜底直连 dashscope 风格上游
+    reasoning: { enabled: false },
+    enable_thinking: false,
   };
 
   const response = await callOpenAICompat(env, request as any);
