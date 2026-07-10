@@ -57,9 +57,11 @@ ENABLE_DAILY_SUMMARY_MEMORY = "false"
 # 此前从未启用：开关只存在于 src/memory/compress.ts，wrangler.toml/dashboard 均未设置，
 # 导致历史无限累积（2026-07 排查：缓存前缀单窗口涨到 69k tokens）。
 ENABLE_HISTORY_COMPRESSION = "true"
-# 摘要目标字数。硬上限是代码里的 max_tokens: 2000，中文 2000 字会超出被截断，
-# 故设 1200 字（约 1500-1800 tokens）留出余量。
-HISTORY_COMPRESS_MAX_CHARS = "1000"
+# 摘要目标字数上限。prompt 给出 2/3~1 倍的目标区间（1000-1500 字），
+# max_tokens 由此值推导作成本保险丝，权威上限是 enforceMaxChars 的句边界字符截断。
+HISTORY_COMPRESS_MAX_CHARS = "1500"
+# 压缩模型：OpenRouter 路由。qwen 中文与长度服从均优于 Workers AI llama-3.3。
+HISTORY_COMPRESS_MODEL = "qwen/qwen3.7-plus"
 
 # ─── Anthropic 缓存 ───
 ANTHROPIC_THINKING_ENABLED = ""
