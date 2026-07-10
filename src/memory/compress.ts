@@ -240,7 +240,20 @@ function simpleHash(text: string): string {
  * 同一对话的同一段，消息不变，指纹不变，缓存命中。
  * 压缩 prompt 改动时递增版本号，强制全量重压缩，避免旧风格摘要经缓存沿用。
  */
-const COMPRESS_PROMPT_VERSION = 4;
+const COMPRESS_PROMPT_VERSION = 5;
+
+/**
+ * 剥离内联思考链。qwen 等模型可能把思考以 <think>…</think> 内联在 content 里，
+ * 不剥会随摘要入 D1 缓存并每轮注入上游。reasoning 参数已关，此处是兜底。
+ */
+function stripThinkingBlocks(text: string): string {
+  let out = text.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, "");
+  // 开标签缺失、只剩前导闭合标签的残链（部分模型省略开标签）
+  if (/<\/think(?:ing)?>/i.test(out)) {
+    out = out.replace(/^[\s\S]*?<\/think(?:ing)?>\s*/i, "");
+  }
+  return out.trim();
+}
 
 function buildSegmentCacheKey(
   namespace: string,
@@ -391,7 +404,7 @@ async function callCompressModel(
         max_tokens: maxTokens,
       });
       const text = (result as any)?.response ?? "";
-      if (typeof text === "string" && text.trim()) return enforceMaxChars(text.trim(), maxChars);
+      if (typeof text === "string" && text.trim()) return enforceMaxChars(stripThinkingBlocks(text), maxChars);
     } catch {
       // Workers AI 失败则 fallback 到 OpenAI compat
     }
@@ -420,5 +433,10 @@ async function callCompressModel(
     throw new Error("Compress model returned empty content");
   }
 
-  return enforceMaxChars(text.trim(), maxChars);
+  const stripped = stripThinkingBlocks(text);
+  if (!stripped) {
+    throw new Error("Compress model returned only thinking content");
+  }
+
+  return enforceMaxChars(stripped, maxChars);
 }
