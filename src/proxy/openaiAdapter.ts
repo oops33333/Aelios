@@ -74,6 +74,8 @@ function useOpenRouter(env: Env, model?: string): boolean {
   if (!model) return false;
   const lower = model.toLowerCase();
   if (lower.startsWith("@cf/") || lower.startsWith("workers-ai/") || lower.startsWith("google/")) return false;
+  // openai/* 走 AI Gateway compat 端点，由统一计费（Cloudflare 托管 key）出钱，不经 OpenRouter
+  if (lower.startsWith("openai/")) return false;
   return true;
 }
 
