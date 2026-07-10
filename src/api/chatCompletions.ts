@@ -22,6 +22,7 @@ import { replayHeartbeatPrefix, storeHeartbeatPrefix } from "../proxy/heartbeatP
 import { buildOpenAICompatRequest, buildOpenAIRequestFromAssembled, callOpenAICompat } from "../proxy/openaiAdapter";
 import { classifyProvider, resolveTargetModel } from "../proxy/resolveModel";
 import { streamAnthropicToOpenAI } from "../proxy/streamAnthropic";
+import { stashThinkingSignature } from "../proxy/thinkingStash";
 import { streamOpenAIWithTee } from "../proxy/streamOpenAI";
 import { CONTENT_RULES } from "../preset/regexRules";
 import { applyRegexRules } from "../preset/regexPipeline";
@@ -365,6 +366,32 @@ export async function handleChatCompletions(
 
     const parsed = parseAnthropicNonStream(anthropicParsed as never);
     const anthropicCacheMode = getAnthropicCacheMode(env);
+
+    // 服务端兜底：非流式同样按 tool_use id 暂存签名 thinking 块（与流式路径对齐）。
+    // await：写入必须先于客户端携带 tool_result 的下一次请求。
+    {
+      const rawBlocks =
+        (anthropicParsed as { content?: Array<{ type?: string; id?: string; thinking?: string; signature?: string }> })
+          .content ?? [];
+      const signedThinking = rawBlocks.find(
+        (b) => b.type === "thinking" && typeof b.signature === "string" && b.signature
+      );
+      const toolUseIds = rawBlocks
+        .filter((b) => b.type === "tool_use" && typeof b.id === "string" && b.id)
+        .map((b) => b.id as string);
+      if (signedThinking && toolUseIds.length > 0) {
+        try {
+          await stashThinkingSignature(env.DB, {
+            namespace: auth.profile.namespace,
+            toolUseIds,
+            thinking: signedThinking.thinking ?? "",
+            signature: signedThinking.signature as string
+          });
+        } catch (error) {
+          console.error("failed to stash thinking signature", error);
+        }
+      }
+    }
     // Filter visible content only — reasoning_content is preserved upstream.
     const filteredContent = applyRegexRules(parsed.content, CONTENT_RULES);
     if (parsed.openai.choices?.[0]?.message) {

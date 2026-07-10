@@ -10,6 +10,7 @@ import {
 } from "../preset/streamFilters";
 import type { Env, KeyProfile, TokenUsage } from "../types";
 import { getSseData, splitSseEvents } from "../utils/sseParser";
+import { stashThinkingSignature } from "./thinkingStash";
 
 interface StreamAnthropicOptions {
   env: Env;
@@ -48,6 +49,8 @@ interface StreamState {
   /** Anthropic content block index → OpenAI tool_calls index */
   toolCallIndexByBlock: Map<number, number>;
   toolCallCount: number;
+  /** 本轮 tool_use 块的上游 id，流末用于暂存签名 thinking 块 */
+  toolUseIds: string[];
 }
 
 function openAIChunk(delta: StreamDelta, finishReason: string | null = null): Uint8Array {
@@ -105,6 +108,9 @@ function consumeAnthropicData(data: string, state: StreamState): StreamDelta | n
       const toolIndex = state.toolCallCount;
       state.toolCallCount += 1;
       state.toolCallIndexByBlock.set(parsed.index, toolIndex);
+      if (typeof parsed.content_block.id === "string" && parsed.content_block.id) {
+        state.toolUseIds.push(parsed.content_block.id);
+      }
       return {
         tool_calls: [
           {
@@ -231,7 +237,8 @@ export function streamAnthropicToOpenAI(upstream: Response, options: StreamAnthr
     finishReason: null,
     thinkingFilter: createThinkingFilterState(),
     toolCallIndexByBlock: new Map(),
-    toolCallCount: 0
+    toolCallCount: 0,
+    toolUseIds: []
   };
 
   void (async () => {
@@ -284,6 +291,23 @@ export function streamAnthropicToOpenAI(upstream: Response, options: StreamAnthr
             ]
           })
         );
+      }
+
+      // 服务端兜底：按 tool_use id 暂存签名 thinking 块，供下一轮工具回环
+      // 在客户端未回传 thinking_blocks 时回填（见 anthropicAdapter）。
+      // 必须 await 完成后再发收束帧：客户端可能在收到 finish 后立刻携带
+      // tool_result 发起下一次请求，waitUntil 会输掉这场竞速。
+      if (state.thinkingSignature && state.toolUseIds.length > 0) {
+        try {
+          await stashThinkingSignature(options.env.DB, {
+            namespace: options.profile.namespace,
+            toolUseIds: state.toolUseIds,
+            thinking: state.reasoningText,
+            signature: state.thinkingSignature
+          });
+        } catch (error) {
+          console.error("failed to stash thinking signature", error);
+        }
       }
 
       // 收束帧：tool_use → tool_calls，end_turn → stop

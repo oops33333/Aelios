@@ -4,6 +4,7 @@ import { assembledToAnthropicMessages, assembledToAnthropicSystem } from "../ass
 import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatResponse, TokenUsage } from "../types";
 import { formatMemoryPatch, formatRemindersBlock } from "../memory/inject";
 import { normalizeAiGatewayBaseUrl } from "./openaiAdapter";
+import { getStashedThinking } from "./thinkingStash";
 
 interface AnthropicCacheControl {
   type: "ephemeral";
@@ -586,20 +587,41 @@ export function convertMessages(messages: OpenAIChatMessage[]): AnthropicMessage
 }
 
 /**
- * thinking 降级守卫：extended thinking 开启时，若末位 assistant 消息含 tool_use
- * 却没有可回放的带签名 thinking 块，上游会以 400（signature 缺失）拒绝。
- * 客户端未能回传 thinking_blocks 时，对本轮请求关闭 thinking 以保通路。
+ * thinking 降级守卫（带服务端回填）：extended thinking 开启时，若末位 assistant
+ * 消息含 tool_use 却没有可回放的带签名 thinking 块，上游会以 400（signature 缺失）
+ * 拒绝。客户端未回传 thinking_blocks 时，先尝试从 D1 暂存按 tool_use id 回填
+ *（见 thinkingStash.ts）；回填成功则 thinking 保持开启——避免 thinking 参数
+ * 逐轮开关横跳打掉 messages 级缓存断点。仅在暂存也未命中时才关闭 thinking 保通路。
+ *
+ * 返回 true 表示 thinking 可保持开启（无需回填或回填成功），false 表示须关闭。
  */
-function shouldDisableThinkingForToolHistory(messages: AnthropicMessage[]): boolean {
+async function restoreSignedThinkingForToolHistory(
+  db: D1Database,
+  namespace: string,
+  messages: AnthropicMessage[]
+): Promise<boolean> {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
     if (message.role !== "assistant") continue;
-    const hasToolUse = message.content.some((block) => block.type === "tool_use");
-    if (!hasToolUse) return false;
-    const hasSignedThinking = message.content.some((block) => block.type === "thinking");
-    return !hasSignedThinking;
+    const toolUses = message.content.filter(
+      (block): block is AnthropicToolUseBlock => block.type === "tool_use"
+    );
+    if (toolUses.length === 0) return true;
+    if (message.content.some((block) => block.type === "thinking")) return true;
+    for (const toolUse of toolUses) {
+      const stashed = await getStashedThinking(db, namespace, toolUse.id);
+      if (stashed) {
+        message.content.unshift({
+          type: "thinking",
+          thinking: stashed.thinking,
+          signature: stashed.signature
+        });
+        return true;
+      }
+    }
+    return false;
   }
-  return false;
+  return true;
 }
 
 export function getAnthropicNativeUrl(env: Env): string {
@@ -667,9 +689,10 @@ export async function buildAnthropicNativeRequest(
   ];
 
   const messages = convertMessages(req.messages);
-  const thinking = shouldDisableThinkingForToolHistory(messages)
-    ? undefined
-    : buildThinkingConfig(input.env, req);
+  let thinking = buildThinkingConfig(input.env, req);
+  if (thinking && !(await restoreSignedThinkingForToolHistory(input.env.DB, input.namespace, messages))) {
+    thinking = undefined;
+  }
   applyRollingMessageCache(messages, input.env);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
   appendUncachedUserContext(messages, formatRemindersBlock(input.reminders || []));
