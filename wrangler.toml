@@ -59,7 +59,7 @@ ENABLE_DAILY_SUMMARY_MEMORY = "false"
 ENABLE_HISTORY_COMPRESSION = "true"
 # 摘要目标字数。硬上限是代码里的 max_tokens: 2000，中文 2000 字会超出被截断，
 # 故设 1200 字（约 1500-1800 tokens）留出余量。
-HISTORY_COMPRESS_MAX_CHARS = "1200"
+HISTORY_COMPRESS_MAX_CHARS = "1000"
 
 # ─── Anthropic 缓存 ───
 ANTHROPIC_THINKING_ENABLED = ""

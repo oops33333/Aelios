@@ -240,7 +240,7 @@ function simpleHash(text: string): string {
  * 同一对话的同一段，消息不变，指纹不变，缓存命中。
  * 压缩 prompt 改动时递增版本号，强制全量重压缩，避免旧风格摘要经缓存沿用。
  */
-const COMPRESS_PROMPT_VERSION = 2;
+const COMPRESS_PROMPT_VERSION = 3;
 
 function buildSegmentCacheKey(
   namespace: string,
@@ -306,6 +306,18 @@ function extractWorkersAiModel(model: string): string | null {
  *   - previousSummary = null → 首段，直接压缩消息
  *   - previousSummary 存在  → 后续段，合并旧摘要 + 新消息
  */
+/**
+ * 长度保险丝：prompt 里的字数目标是软约束，小模型常越界。
+ * 超过上限 20% 即硬截断——截尾部（最新段）损失最小，因为紧邻的
+ * 近期消息以原文形式在上下文里，与摘要尾部覆盖的时间段相接。
+ */
+function enforceMaxChars(text: string, maxChars: number): string {
+  const hardCap = Math.floor(maxChars * 1.2);
+  if (text.length <= hardCap) return text;
+  console.log(`[compress] summary over cap: ${text.length} > ${hardCap} chars, hard-truncated`);
+  return `${text.slice(0, hardCap)}\n（摘要超长，已截断）`;
+}
+
 async function callCompressModel(
   env: Env,
   messages: OpenAIChatMessage[],
@@ -321,12 +333,13 @@ async function callCompressModel(
   ].join("\n");
 
   const requirements = [
-    `1. 用中文输出，目标 ${maxChars} 字以内`,
-    "2. 事实优先：保留关键事实、数据、做出的决定、达成的约定、未完成的话题与待办事项",
-    "3. 情绪与关系动态同样是事实，用陈述句记录（如\"用户对某事感到不安，助手予以安抚\"），记录其存在与走向即可，不要渲染、不要重演",
-    "4. 双方使用的称呼、约定的说法作为事实记录（如\"助手称用户为某某\"），你自己不要使用这些称呼",
-    "5. 只写摘要本身，不加任何解释、评价或元说明",
-    "6. 丢弃心跳探测消息（仅含 'ping' 或类似无实质内容的对话轮次），不将其纳入摘要",
+    `1. 用中文输出，硬性上限 ${maxChars} 字，宁短勿超。接近上限时删细节、保结论`,
+    "2. 只记录用户与助手之间的互动事实：谁提出了什么、讨论出什么结果、做了什么决定、事情进行到哪一步、还有什么没完成",
+    "3. 对话中提及的用户过去经历、往事、记忆内容、引用的外部材料：一律不复述细节，最多一句话指代（如\"用户谈及一段过去的经历，助手回应安抚\"）",
+    "4. 情绪与关系动态用一句陈述句带过（如\"用户对某事感到不安，助手予以安抚\"），不展开、不渲染、不重演",
+    "5. 双方使用的称呼作为事实记一次即可，你自己不要使用这些称呼",
+    "6. 只写摘要本身，不加任何解释、评价或元说明",
+    "7. 丢弃心跳探测消息（仅含 'ping' 或类似无实质内容的对话轮次），不将其纳入摘要",
   ].join("\n");
 
   let compressPrompt: string;
@@ -334,7 +347,7 @@ async function callCompressModel(
   if (previousSummary) {
     compressPrompt = [
       stance,
-      "把旧摘要与新对话段合并为一份更新的档案摘要。若旧摘要中存在第一人称或角色口吻，一并改写为第三人称。",
+      "把旧摘要与新对话段合并为一份更新的档案摘要，总长仍受同一上限约束。合并时按时间衰减取舍：越早的内容写得越简，只留结论，为新内容腾出篇幅。若旧摘要中存在第一人称或角色口吻，一并改写为第三人称。",
       "",
       "要求：",
       requirements,
@@ -366,7 +379,7 @@ async function callCompressModel(
         max_tokens: 2000,
       });
       const text = (result as any)?.response ?? "";
-      if (typeof text === "string" && text.trim()) return text.trim();
+      if (typeof text === "string" && text.trim()) return enforceMaxChars(text.trim(), maxChars);
     } catch {
       // Workers AI 失败则 fallback 到 OpenAI compat
     }
@@ -391,5 +404,5 @@ async function callCompressModel(
     throw new Error("Compress model returned empty content");
   }
 
-  return text.trim();
+  return enforceMaxChars(text.trim(), maxChars);
 }
