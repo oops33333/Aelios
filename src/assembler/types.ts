@@ -90,11 +90,11 @@ export interface AssembledPrompt {
 // ---------------------------------------------------------------------------
 
 export const BLOCK_ORDER: readonly string[] = [
-  "proxy_static_rules",
+  "client_system",
   "persona_pinned",
   "long_term_summary",
+  "proxy_static_rules",
   "preset_lite",
-  "client_system",
   "compressed_summary",
   "client_volatile_context",
   "dynamic_memory_patch",
@@ -105,8 +105,10 @@ export const BLOCK_ORDER: readonly string[] = [
 ] as const;
 
 /**
- * The cache anchor always falls after client_system (index 4).
- * Stable blocks before it stay cached; dynamic/passthrough blocks after do not.
+ * client_system 必须位于首位且独占 BP1：它是唯一逐字节不变的块，前面压任何
+ * 每轮现取的内容（persona_pinned 的 importance、long_term_summary 的更新）
+ * 都会连锚点一起打掉整条前缀。persona/summary 的漂移只允许伤及 BP2
+ * （compressed_summary）及之后，保证每一轮至少 BP1 命中。
  */
 export const CACHE_ANCHOR_AFTER_ID = "client_system";
 

@@ -39,11 +39,12 @@ function simpleHash(text) {
 // ---------------------------------------------------------------------------
 
 const BLOCK_ORDER = [
-  "proxy_static_rules",
+  "client_system",
   "persona_pinned",
   "long_term_summary",
+  "proxy_static_rules",
   "preset_lite",
-  "client_system",
+  "compressed_summary",
   "client_volatile_context",
   "dynamic_memory_patch",
   "reminders",
@@ -236,12 +237,22 @@ function assemble(ctx) {
       if (ctx.visionOutput) {
         text = `<vision_context>\n${ctx.visionOutput}\n</vision_context>`;
       }
+    } else if (blockId === "compressed_summary") {
+      if (ctx.compressedSummary) {
+        text = [
+          "[以下是之前对话的压缩摘要]",
+          "",
+          ctx.compressedSummary,
+          "",
+          "[摘要结束，以下是最近的对话]",
+        ].join("\n");
+      }
     }
 
     if (text === null) continue;
 
     const systemBlock = { role: "system", text };
-    if (blockId === "client_system") {
+    if (blockId === "client_system" || blockId === "compressed_summary") {
       systemBlock.cache_control = { type: "ephemeral", ttl: "5m" };
       anchorIndex = systemBlocks.length;
     }
@@ -310,6 +321,7 @@ function makeBaseCtx() {
       { role: "assistant", content: "你好呀！" },
     ],
     currentUserMessage: { role: "user", content: "今天天气怎么样？" },
+    compressedSummary: null,
   };
 }
 
@@ -473,24 +485,28 @@ check("no other block has cache_control", () => {
   }
 });
 
-check("stable blocks come before client_system, dynamic after", () => {
+check("client_system comes first; stable blocks after it, dynamic last", () => {
   const ctx = makeBaseCtx();
   const result = assemble(ctx);
 
   const csPos = result.meta.block_ids.indexOf("client_system");
-  const stableBefore = ["proxy_static_rules", "persona_pinned", "long_term_summary", "preset_lite"];
+  assert.strictEqual(csPos, 0, "client_system must be the first block (BP1 owns the prefix head)");
+
+  const stableAfter = ["persona_pinned", "long_term_summary", "proxy_static_rules", "preset_lite"];
   const dynamicAfter = ["dynamic_memory_patch", "reminders", "vision_context"];
 
-  for (const id of stableBefore) {
+  let maxStablePos = csPos;
+  for (const id of stableAfter) {
     const pos = result.meta.block_ids.indexOf(id);
     if (pos >= 0) {
-      assert.ok(pos < csPos, `${id} should come before client_system`);
+      assert.ok(pos > csPos, `${id} should come after client_system`);
+      maxStablePos = Math.max(maxStablePos, pos);
     }
   }
   for (const id of dynamicAfter) {
     const pos = result.meta.block_ids.indexOf(id);
     if (pos >= 0) {
-      assert.ok(pos > csPos, `${id} should come after client_system`);
+      assert.ok(pos > maxStablePos, `${id} should come after all stable blocks`);
     }
   }
 });
@@ -1214,11 +1230,13 @@ check("Anthropic path: full pipeline produces valid system + messages", () => {
   const systemBlocks = assembledToAnthropicSystem(assembled.system_blocks);
   applyCacheOverrides(systemBlocks, {});
 
-  // Should have: proxy_static_rules, persona_pinned(skip), long_term_summary(skip),
-  //              preset_lite, client_system, dynamic_memory_patch
+  // Should have: client_system, persona_pinned, long_term_summary,
+  //              proxy_static_rules, preset_lite, dynamic_memory_patch
   assert.ok(systemBlocks.length >= 3);
-  // First block text should contain proxy rules
-  assert.ok(systemBlocks[0].text.includes("前端提供的角色"));
+  // First block must be the client prompt — BP1 owns the prefix head
+  assert.ok(systemBlocks[0].text.includes("咲咲的伴侣"));
+  // Proxy rules still present, just after the prompt
+  assert.ok(systemBlocks.some((b) => b.text.includes("前端提供的角色")));
   // Cache anchor present
   const anchor = systemBlocks.find((b) => b.cache_control);
   assert.ok(anchor);

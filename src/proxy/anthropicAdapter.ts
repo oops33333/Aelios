@@ -1,6 +1,7 @@
 import { buildStableMemoryPack } from "../memory/stablePack";
 import type { AssembledPrompt } from "../assembler/types";
 import { assembledToAnthropicMessages, assembledToAnthropicSystem } from "../assembler/toAnthropic";
+import { formatVolatileContext, splitClientSystem } from "../assembler/blocks";
 import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatResponse, TokenUsage } from "../types";
 import { formatMemoryPatch, formatRemindersBlock } from "../memory/inject";
 import { normalizeAiGatewayBaseUrl } from "./openaiAdapter";
@@ -501,14 +502,6 @@ function getAnthropicMaxTokens(
   return Math.max(maxTokens, thinking.budget_tokens + Math.min(Math.max(maxTokens, 256), 4096));
 }
 
-function extractSystemBlocks(messages: OpenAIChatMessage[]): AnthropicTextBlock[] {
-  return messages
-    .filter((message) => message.role === "system")
-    .map((message) => contentToText(message.content).trim())
-    .filter(Boolean)
-    .map((text) => ({ type: "text", text }));
-}
-
 /**
  * OpenAI 消息 → Anthropic 消息，保留结构化块：
  * - assistant.tool_calls   → tool_use 块（arguments JSON 解析为 input）
@@ -675,8 +668,21 @@ export async function buildAnthropicNativeRequest(
   }
 
   const dynamicMemoryPatch = formatMemoryPatch(input.memories);
+
+  // 客户端 prompt 与 assembler 路径逐字节同构（stable 段 \n\n 拼接为单块）并独占
+  // BP1：两条拼装路径随 tool 消息有无来回切换时，至少首断点必命中。时间行等
+  // 易变内容剥出，追加到消息尾部的非缓存区，不许它们坐在断点之前。
+  const { stable: clientStable, volatile: clientVolatile } = splitClientSystem(req.messages);
+  const clientSystemBlocks: AnthropicTextBlock[] = [];
+  if (clientStable.length > 0) {
+    const clientBlock: AnthropicTextBlock = { type: "text", text: clientStable.join("\n\n") };
+    const breakpoint = buildCacheControl(input.env);
+    if (breakpoint) clientBlock.cache_control = breakpoint;
+    clientSystemBlocks.push(clientBlock);
+  }
+
   const system: AnthropicTextBlock[] = [
-    ...extractSystemBlocks(req.messages),
+    ...clientSystemBlocks,
     {
       type: "text",
       text: [
@@ -694,6 +700,7 @@ export async function buildAnthropicNativeRequest(
     thinking = undefined;
   }
   applyRollingMessageCache(messages, input.env);
+  appendUncachedUserContext(messages, formatVolatileContext(clientVolatile));
   appendUncachedUserContext(messages, dynamicMemoryPatch);
   appendUncachedUserContext(messages, formatRemindersBlock(input.reminders || []));
   appendUncachedUserContext(messages, buildTimeContext());

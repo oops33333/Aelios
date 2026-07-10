@@ -72,7 +72,7 @@ function messageToOutput(
 }
 
 // ---------------------------------------------------------------------------
-// Block 1: proxy_static_rules (stable)
+// Block 4: proxy_static_rules (stable)
 // ---------------------------------------------------------------------------
 
 const PROXY_STATIC_RULES_TEXT = [
@@ -151,7 +151,7 @@ const longTermSummaryBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 4: preset_lite (stable)
+// Block 5: preset_lite (stable)
 // Fixed string from plan §5.1, ≤300 chars, hardcoded constant.
 // ---------------------------------------------------------------------------
 
@@ -173,7 +173,7 @@ const presetLiteBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 5: client_system (stable, cache_anchor = true)
+// Block 1: client_system (stable, cache_anchor = true) — 必须位于块序首位
 // Frontend system messages concatenated.
 // ---------------------------------------------------------------------------
 
@@ -207,7 +207,7 @@ function isVolatileTimeLine(line: string): boolean {
   return hasTimeLabel && (hasDateLikeValue || /\btimezone\b/i.test(normalized) || /时区/.test(normalized));
 }
 
-function splitClientSystemTexts(texts: string[]): { stable: string[]; volatile: string[] } {
+export function splitClientSystemTexts(texts: string[]): { stable: string[]; volatile: string[] } {
   const stable: string[] = [];
   const volatile: string[] = [];
 
@@ -241,9 +241,30 @@ const clientSystemBlock: Block = {
   },
 };
 
+/**
+ * Shared by the anthropic fallback path (tool-content requests) so both
+ * assembly paths emit a byte-identical client_system block — the BP1 cache
+ * breakpoint must survive flips between the assembler and the fallback.
+ */
+export function splitClientSystem(
+  messages: OpenAIChatMessage[]
+): { stable: string[]; volatile: string[] } {
+  return splitClientSystemTexts(extractSystemTexts(messages));
+}
+
+export function formatVolatileContext(volatile: string[]): string | null {
+  if (volatile.length === 0) return null;
+  return [
+    "<volatile_context>",
+    "以下是客户端提供的当前时间/日期等本轮上下文，只用于当前回复，不要当作长期设定。",
+    ...volatile,
+    "</volatile_context>",
+  ].join("\n");
+}
+
 
 // ---------------------------------------------------------------------------
-// Block 5.25: compressed_summary (stable, cache_anchor = true)
+// Block 6: compressed_summary (stable, cache_anchor = true)
 // Compressed summary of old conversation history.
 // Only present when history exceeds threshold and compression is enabled.
 // Acts as a second cache layer — changes only every ~25 rounds.
@@ -267,7 +288,7 @@ const compressedSummaryBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 5.5: client_volatile_context (dynamic)
+// Block 7: client_volatile_context (dynamic)
 // Frontend time/date lines split out of client_system so they do not poison
 // the stable Claude prompt-cache anchor.
 // ---------------------------------------------------------------------------
@@ -279,18 +300,12 @@ const clientVolatileContextBlock: Block = {
   cache_anchor: false,
   content_fn: (ctx: AssemblerContext): string | null => {
     const { volatile } = splitClientSystemTexts(extractSystemTexts(ctx.systemMessages));
-    if (volatile.length === 0) return null;
-    return [
-      "<volatile_context>",
-      "以下是客户端提供的当前时间/日期等本轮上下文，只用于当前回复，不要当作长期设定。",
-      ...volatile,
-      "</volatile_context>",
-    ].join("\n");
+    return formatVolatileContext(volatile);
   },
 };
 
 // ---------------------------------------------------------------------------
-// Block 6: dynamic_memory_patch (dynamic)
+// Block 8: dynamic_memory_patch (dynamic)
 // Current RAG hits, tagged <memories>...</memories>.
 // ---------------------------------------------------------------------------
 
@@ -320,7 +335,7 @@ const dynamicMemoryPatchBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 6.5: reminders (dynamic)
+// Block 9: reminders (dynamic)
 // Date reminders from sweepy, injected on first round only.
 // ---------------------------------------------------------------------------
 
@@ -340,7 +355,7 @@ const remindersBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 7: vision_context (dynamic)
+// Block 10: vision_context (dynamic)
 // Vision assistant output; only when image present + main model non-multimodal.
 // ---------------------------------------------------------------------------
 
@@ -356,7 +371,7 @@ const visionContextBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 8: recent_history (passthrough)
+// Block 11: recent_history (passthrough)
 // Frontend messages excluding system and the final user message.
 // Routes to AssembledPrompt.messages with original content preserved.
 // History strip (§5.2 regex) will be applied in P2.
@@ -372,7 +387,7 @@ const recentHistoryBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
-// Block 9: current_user (passthrough)
+// Block 12: current_user (passthrough)
 // The last user message, untouched — original content preserved.
 // Routes to AssembledPrompt.messages.
 // ---------------------------------------------------------------------------
