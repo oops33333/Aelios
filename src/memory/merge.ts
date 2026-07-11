@@ -103,11 +103,21 @@ function parseDecision(text: string): MemoryMergeDecision | null {
   };
 }
 
+// 记忆分家（2026-07-11）：sweepy-mirror 镜像行由服务端同步脚本独占管辖，
+// 任何写入都会在下一轮全量同步被主库冲回。若把镜像行当 merge/supersede 目标，
+// 合并进去的新内容会无声蒸发（C1 事故路径）。故镜像行一律视同 pinned：
+// 只能 keep_both，新记忆必须落到 default namespace 自产区。
+const MIRROR_NAMESPACE = "sweepy-mirror";
+
+function isMirrorRecord(record: { namespace?: string | null }): boolean {
+  return record.namespace === MIRROR_NAMESPACE;
+}
+
 function chooseFallbackDecision(
   incoming: ExtractedMemory,
   candidates: MemoryApiRecord[]
 ): MemoryMergeDecision {
-  const target = candidates.find((candidate) => !candidate.pinned);
+  const target = candidates.find((candidate) => !candidate.pinned && !isMirrorRecord(candidate));
   if (!target) return { action: "keep_both" };
 
   if (isCorrection(incoming.content)) {
@@ -132,7 +142,7 @@ function buildMergePrompt(input: { incoming: ExtractedMemory; candidates: Memory
     content: candidate.content,
     importance: candidate.importance,
     confidence: candidate.confidence,
-    pinned: candidate.pinned,
+    pinned: candidate.pinned || isMirrorRecord(candidate),
     tags: candidate.tags,
     score: candidate.score
   }));
@@ -247,7 +257,7 @@ function resolveTarget(decision: MemoryMergeDecision, candidates: MemoryApiRecor
   if (decision.target_id) {
     return candidates.find((candidate) => candidate.id === decision.target_id) ?? null;
   }
-  return candidates.find((candidate) => !candidate.pinned) ?? null;
+  return candidates.find((candidate) => !candidate.pinned && !isMirrorRecord(candidate)) ?? null;
 }
 
 export async function persistMemoryWithMerge(
@@ -270,12 +280,12 @@ export async function persistMemoryWithMerge(
   }
 
   const target = resolveTarget(decision, candidates);
-  if (!target || decision.action === "keep_both" || target.pinned) {
+  if (!target || decision.action === "keep_both" || target.pinned || isMirrorRecord(target)) {
     return createNewMemory(env, input);
   }
 
   const existing = await getMemoryById(env, { namespace: input.namespace, id: target.id });
-  if (!existing || existing.status !== "active" || existing.pinned) {
+  if (!existing || existing.status !== "active" || existing.pinned || isMirrorRecord(existing)) {
     return createNewMemory(env, input);
   }
 

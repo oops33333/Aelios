@@ -265,6 +265,7 @@ export async function updateMemory(
   if (input.patch.status !== undefined) body.status = input.patch.status;
   if (input.patch.pinned !== undefined) body.pinned = input.patch.pinned;
   if (input.patch.tags !== undefined) body.tags = input.patch.tags;
+  if (input.patch.sourceMessageIds !== undefined) body.source_message_ids = input.patch.sourceMessageIds;
   if (input.patch.expiresAt !== undefined) body.expires_at = input.patch.expiresAt;
 
   if (Object.keys(body).length === 0) {
