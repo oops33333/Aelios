@@ -1,21 +1,23 @@
 /**
- * memories.ts — 对接 sweepy.cloud 的记忆适配层
+ * memories.ts — 对接 aeliosmemory（sweepy.cloud/aeliosmemory）的记忆适配层
  *
- * 原版通过 D1 SQL 读写，现改为 HTTP 调用 sweepy API。
- * 函数签名从 (db: D1Database, ...) 改为 (env: Env, ...)，
- * 调用方需将 env.DB 改为 env。
+ * 2026-07-11 记忆分家：存储后端从 sweepy 主库切换到 aelios 专属库。
+ * 服务端即原生 schema（importance 0-1 实数、tags JSON 数组、真实 status/pinned 列、
+ * namespace 区分 sweepy-mirror 镜像与 default 自产），字段直通，
+ * 旧版 SweepyRecord 映射补丁（tags 模拟 status、content>700 过滤、importance 量纲混用）全部移除。
+ * 镜像行由服务端同步脚本独占管辖：对镜像行的更新会在下一轮全量同步被主库冲回。
  */
 
 import type { Env, MemoryRecord } from "../types";
 import { nowIso } from "../utils/time";
 
-// ─── sweepy HTTP helpers ───
+// ─── HTTP helpers ───
 
-function sweepyUrl(env: Env): string {
-  return (env.SWEEPY_URL || "https://sweepy.cloud").replace(/\/+$/, "");
+function memoryApiBase(env: Env): string {
+  return (env.SWEEPY_URL || "https://sweepy.cloud/aeliosmemory").replace(/\/+$/, "");
 }
 
-function sweepyHeaders(env: Env): HeadersInit {
+function memoryApiHeaders(env: Env): HeadersInit {
   const auth = env.SWEEPY_AUTH || "";
   return {
     "content-type": "application/json",
@@ -23,63 +25,63 @@ function sweepyHeaders(env: Env): HeadersInit {
   };
 }
 
-async function sweepyFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
-  const base = sweepyUrl(env);
+async function memoryApiFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
+  const base = memoryApiBase(env);
   return fetch(`${base}${path}`, {
     ...init,
-    headers: { ...sweepyHeaders(env), ...(init?.headers || {}) },
+    headers: { ...memoryApiHeaders(env), ...(init?.headers || {}) },
   });
 }
 
-// ─── sweepy record ↔ MemoryRecord 转换 ───
+// ─── 服务端记录（原生 API 形状）↔ MemoryRecord 转换 ───
 
-interface SweepyRecord {
-  id: number;
+interface ApiMemory {
+  id: string;
+  namespace: string;
+  type: string;
   content: string;
-  category: string;
-  tags: string;
+  summary: string | null;
+  importance: number;
+  confidence: number;
+  status: string;
+  pinned: number;
+  tags: string[];
   source: string | null;
+  source_message_ids: string[];
+  vector_id: string | null;
+  last_recalled_at: string | null;
+  recall_count: number;
   created_at: string;
   updated_at: string;
-  image_path: string | null;
-  valence: number;
-  arousal: number;
-  importance: number;
-  activation_count: number;
-  last_active: string | null;
-  resolved: number;
+  expires_at: string | null;
+  score?: number;
+  similarity?: number;
 }
 
-function sweepyToMemoryRecord(s: SweepyRecord, namespace: string): MemoryRecord {
-  const tags = s.tags
-    ? JSON.stringify(s.tags.split(",").map((t: string) => t.trim()).filter(Boolean))
-    : "[]";
-
-  const isPinned = s.tags?.includes("pinned") || s.tags?.includes("必读") ? 1 : 0;
-
+function apiToRecord(m: ApiMemory): MemoryRecord {
   return {
-    id: String(s.id),
-    namespace,
-    type: s.category || "note",
-    content: s.content,
-    summary: null,
-    importance: s.importance ?? 0.5,
-    confidence: 0.8,
-    status: "active",
-    pinned: isPinned,
-    tags,
-    source: s.source,
-    source_message_ids: "[]",
-    vector_id: `sweepy_${s.id}`,
-    last_recalled_at: s.last_active,
-    recall_count: s.activation_count || 0,
-    created_at: s.created_at,
-    updated_at: s.updated_at,
-    expires_at: null,
+    id: String(m.id),
+    namespace: m.namespace || "default",
+    type: m.type || "note",
+    content: m.content,
+    summary: m.summary ?? null,
+    importance: typeof m.importance === "number" ? m.importance : 0.5,
+    confidence: typeof m.confidence === "number" ? m.confidence : 0.8,
+    status: m.status || "active",
+    pinned: m.pinned ? 1 : 0,
+    tags: JSON.stringify(Array.isArray(m.tags) ? m.tags : []),
+    source: m.source ?? null,
+    source_message_ids: JSON.stringify(Array.isArray(m.source_message_ids) ? m.source_message_ids : []),
+    vector_id: m.vector_id ?? null,
+    last_recalled_at: m.last_recalled_at || null,
+    recall_count: m.recall_count ?? 0,
+    created_at: m.created_at,
+    updated_at: m.updated_at,
+    expires_at: m.expires_at ?? null,
   };
 }
 
-// ─── 公开接口 ───
+// ─── 公开接口（签名与旧版一致，调用方零改动）───
 
 export interface CreateMemoryInput {
   namespace: string;
@@ -124,29 +126,31 @@ export interface UpdateMemoryInput {
 }
 
 /**
- * 写入一条记忆到 sweepy
+ * 写入一条记忆（namespace='default' 自产区；embedding 由服务端异步生成）
  */
 export async function createMemory(env: Env, input: CreateMemoryInput): Promise<MemoryRecord> {
-  const tagsArray = input.tags ?? [];
-  if (input.pinned && !tagsArray.includes("pinned")) tagsArray.push("pinned");
-
   const body = {
+    namespace: input.namespace || "default",
+    type: input.type || "note",
     content: input.content,
-    category: input.type || "note",
-    tags: ["aelios", ...tagsArray].join(","),
-    source: input.source || "aelios",
+    summary: input.summary ?? null,
     importance: input.importance ?? 0.5,
-    valence: 0,
-    arousal: 0.3,
+    confidence: input.confidence ?? 0.8,
+    status: input.status || "active",
+    pinned: input.pinned === true,
+    tags: input.tags ?? [],
+    source: input.source || "aelios",
+    source_message_ids: input.sourceMessageIds ?? [],
+    expires_at: input.expiresAt ?? null,
   };
 
-  const res = await sweepyFetch(env, "/api/memories", {
+  const res = await memoryApiFetch(env, "/api/memories", {
     method: "POST",
     body: JSON.stringify(body),
   });
 
   if (!res.ok) {
-    console.error("sweepy createMemory failed", res.status, await res.text());
+    console.error("aeliosmemory createMemory failed", res.status, await res.text());
     // 返回一个占位记录，不阻断上游流程
     const now = nowIso();
     return {
@@ -154,12 +158,12 @@ export async function createMemory(env: Env, input: CreateMemoryInput): Promise<
       namespace: input.namespace,
       type: input.type,
       content: input.content,
-      summary: null,
+      summary: input.summary ?? null,
       importance: input.importance ?? 0.5,
-      confidence: 0.8,
+      confidence: input.confidence ?? 0.8,
       status: "active",
       pinned: input.pinned ? 1 : 0,
-      tags: JSON.stringify(tagsArray),
+      tags: JSON.stringify(input.tags ?? []),
       source: input.source ?? null,
       source_message_ids: "[]",
       vector_id: null,
@@ -171,38 +175,32 @@ export async function createMemory(env: Env, input: CreateMemoryInput): Promise<
     };
   }
 
-  const created = (await res.json()) as SweepyRecord;
-  return sweepyToMemoryRecord(created, input.namespace);
+  const data = (await res.json()) as { ok: boolean; memory: ApiMemory };
+  return apiToRecord(data.memory);
 }
 
 /**
- * 列出记忆（按 importance 降序）
+ * 列出记忆（服务端排序：pinned DESC, importance DESC, created_at DESC；默认仅 active）
+ * 注意不传 namespace 过滤——aelios 需要同时看见镜像区与自产区。
  */
 export async function listMemoriesPage(env: Env, filters: ListMemoryFilters): Promise<ListMemoryPage> {
-  let path = "/api/memories?";
-  const params: string[] = [];
-
-  if (filters.type) params.push(`keyword=${encodeURIComponent(filters.type)}`);
-
-  const res = await sweepyFetch(env, `/api/memories${params.length ? "?" + params.join("&") : ""}`);
-
-  if (!res.ok) {
-    console.error("sweepy listMemories failed", res.status);
-    return { records: [], hasMore: false, nextOffset: null };
-  }
-
-  const all = (await res.json()) as SweepyRecord[];
   const offset = Math.max(filters.offset ?? 0, 0);
   const limit = Math.max(filters.limit, 1);
 
-  // 过滤状态（sweepy 没有 status 字段，用 tags 模拟）
-  let filtered = all;
-  if (filters.status === "active") {
-    filtered = all.filter((r) => !r.tags?.includes("deleted") && !r.tags?.includes("superseded") && r.content.length <= 700);
+  const params: string[] = [`limit=${offset + limit + 1}`];
+  if (filters.type) params.push(`type=${encodeURIComponent(filters.type)}`);
+  if (filters.status) params.push(`status=${encodeURIComponent(filters.status)}`);
+
+  const res = await memoryApiFetch(env, `/api/memories?${params.join("&")}`);
+
+  if (!res.ok) {
+    console.error("aeliosmemory listMemories failed", res.status);
+    return { records: [], hasMore: false, nextOffset: null };
   }
 
-  const sliced = filtered.slice(offset, offset + limit + 1);
-  const records = sliced.slice(0, limit).map((r) => sweepyToMemoryRecord(r, filters.namespace));
+  const all = (await res.json()) as ApiMemory[];
+  const sliced = all.slice(offset, offset + limit + 1);
+  const records = sliced.slice(0, limit).map(apiToRecord);
 
   return {
     records,
@@ -217,21 +215,21 @@ export async function listMemories(env: Env, filters: ListMemoryFilters): Promis
 }
 
 /**
- * 按 ID 读取单条记忆
+ * 按 ID 读取单条记忆（id 为 TEXT：am- / sweepy- / legacy- 前缀）
  */
 export async function getMemoryById(
   env: Env,
   input: { namespace: string; id: string }
 ): Promise<MemoryRecord | null> {
-  const res = await sweepyFetch(env, `/api/memories/${input.id}`);
+  const res = await memoryApiFetch(env, `/api/memories/${encodeURIComponent(input.id)}`);
   if (!res.ok) return null;
 
-  const record = (await res.json()) as SweepyRecord;
-  return sweepyToMemoryRecord(record, input.namespace);
+  const record = (await res.json()) as ApiMemory;
+  return apiToRecord(record);
 }
 
 /**
- * 批量按 ID 读取
+ * 批量按 ID 读取（服务端无批量接口，逐条读取）
  */
 export async function fetchMemoriesByIds(
   env: Env,
@@ -239,7 +237,6 @@ export async function fetchMemoriesByIds(
 ): Promise<MemoryRecord[]> {
   if (input.ids.length === 0) return [];
 
-  // sweepy 没有批量读取接口，逐条读取
   const results = await Promise.allSettled(
     input.ids.map((id) => getMemoryById(env, { namespace: input.namespace, id }))
   );
@@ -251,7 +248,8 @@ export async function fetchMemoriesByIds(
 }
 
 /**
- * 更新记忆
+ * 更新记忆（原生字段直通；status 为真实列。
+ * 若目标是 sweepy-mirror 镜像行，更新会生效但将在下一轮同步被主库冲回。）
  */
 export async function updateMemory(
   env: Env,
@@ -260,37 +258,35 @@ export async function updateMemory(
   const body: Record<string, unknown> = {};
 
   if (input.patch.content !== undefined) body.content = input.patch.content;
-  if (input.patch.type !== undefined) body.category = input.patch.type;
+  if (input.patch.type !== undefined) body.type = input.patch.type;
+  if (input.patch.summary !== undefined) body.summary = input.patch.summary;
   if (input.patch.importance !== undefined) body.importance = input.patch.importance;
-  if (input.patch.tags !== undefined) body.tags = input.patch.tags.join(",");
-  if (input.patch.status !== undefined) {
-    // sweepy 没有 status 字段，用 tags 标记
-    const currentTags = typeof body.tags === "string" ? body.tags : "";
-    if (input.patch.status === "deleted" || input.patch.status === "superseded") {
-      body.tags = currentTags ? `${currentTags},${input.patch.status}` : input.patch.status;
-    }
-  }
+  if (input.patch.confidence !== undefined) body.confidence = input.patch.confidence;
+  if (input.patch.status !== undefined) body.status = input.patch.status;
+  if (input.patch.pinned !== undefined) body.pinned = input.patch.pinned;
+  if (input.patch.tags !== undefined) body.tags = input.patch.tags;
+  if (input.patch.expiresAt !== undefined) body.expires_at = input.patch.expiresAt;
 
   if (Object.keys(body).length === 0) {
     return getMemoryById(env, input);
   }
 
-  const res = await sweepyFetch(env, `/api/memories/${input.id}`, {
+  const res = await memoryApiFetch(env, `/api/memories/${encodeURIComponent(input.id)}`, {
     method: "PUT",
     body: JSON.stringify(body),
   });
 
   if (!res.ok) {
-    console.error("sweepy updateMemory failed", res.status, await res.text());
+    console.error("aeliosmemory updateMemory failed", res.status, await res.text());
     return getMemoryById(env, input);
   }
 
-  const updated = (await res.json()) as SweepyRecord;
-  return sweepyToMemoryRecord(updated, input.namespace);
+  const updated = (await res.json()) as ApiMemory;
+  return apiToRecord(updated);
 }
 
 /**
- * 软删除
+ * 软删除（status='deleted'，服务端真实列）
  */
 export async function softDeleteMemory(
   env: Env,
@@ -304,7 +300,7 @@ export async function softDeleteMemory(
 }
 
 /**
- * 文本搜索记忆 — 调用 sweepy 的语义向量搜索
+ * 语义检索 — 服务端 qwen3-embedding-8b 余弦（阈值 0.4），命中自动累加 recall_count
  */
 export async function searchMemoriesByText(
   env: Env,
@@ -313,31 +309,30 @@ export async function searchMemoriesByText(
   const query = input.query.trim().slice(0, 500);
   if (!query) return [];
 
-  const encodedQuery = encodeURIComponent(query);
-  const res = await sweepyFetch(env, `/api/memories/search?q=${encodedQuery}`);
+  const res = await memoryApiFetch(
+    env,
+    `/api/memories/search?q=${encodeURIComponent(query)}&limit=${Math.max(input.limit, 1)}`
+  );
 
   if (!res.ok) {
-    console.error("sweepy search failed", res.status);
+    console.error("aeliosmemory search failed", res.status);
     return [];
   }
 
-  const results = (await res.json()) as Array<SweepyRecord & { similarity?: number }>;
+  const results = (await res.json()) as ApiMemory[];
 
-  return results
-    .filter((r) => !r.tags?.includes("deleted") && !r.tags?.includes("superseded") && r.content.length <= 700)
-    .slice(0, input.limit)
-    .map((r) => ({
-      ...sweepyToMemoryRecord(r, input.namespace),
-      score: r.similarity ?? 0.7,
-    }));
+  return results.slice(0, input.limit).map((r) => ({
+    ...apiToRecord(r),
+    score: r.score ?? r.similarity ?? 0.7,
+  }));
 }
 
 /**
- * 标记记忆被召回（sweepy 没有专用接口，跳过）
+ * 标记记忆被召回（服务端 search/单读已自增 recall_count，此处无事可做）
  */
 export async function markMemoriesRecalled(
   _env: Env,
   _input: { namespace: string; ids: string[] }
 ): Promise<void> {
-  // sweepy 有自己的 activation_count 机制，这里不额外处理
+  // aeliosmemory 在 search 与单读时自增 recall_count，无需额外调用
 }

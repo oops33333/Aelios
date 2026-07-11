@@ -157,7 +157,7 @@ export async function selectMemoriesForInjection(
 
 export async function fetchSweepyReminders(env: Env): Promise<string[]> {
   try {
-    const base = (env.SWEEPY_URL || "https://sweepy.cloud").replace(/\/+$/, "");
+    const base = (env.SWEEPY_URL || "https://sweepy.cloud/aeliosmemory").replace(/\/+$/, "");
     const auth = env.SWEEPY_AUTH || "";
     const res = await fetch(base + "/api/memories/reminders", {
       headers: {
