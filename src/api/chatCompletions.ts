@@ -18,7 +18,7 @@ import {
   getAnthropicCacheMode,
   parseAnthropicNonStream
 } from "../proxy/anthropicAdapter";
-import { replayHeartbeatPrefix, storeHeartbeatPrefix } from "../proxy/heartbeatPrefix";
+import { loadHeartbeatBody, makeReplayable, storeHeartbeatBody } from "../proxy/heartbeatPrefix";
 import { buildOpenAICompatRequest, buildOpenAIRequestFromAssembled, callOpenAICompat } from "../proxy/openaiAdapter";
 import { classifyProvider, resolveTargetModel } from "../proxy/resolveModel";
 import { streamAnthropicToOpenAI } from "../proxy/streamAnthropic";
@@ -122,24 +122,14 @@ export async function handleChatCompletions(
     // 心跳不落库也不该走流式；防止下游 conversation!.id 空指针
     body = { ...body, stream: false };
 
-    // 首选：重放最近一次真实请求的缓存前缀，逐字节命中并刷新全部断点 TTL。
-    // 无存储前缀（或上游失败）时回退到旧的 ping 组装路径。
-    const replayed = await replayHeartbeatPrefix(env, auth.profile.namespace);
-    if (replayed) {
-      if (replayed.ok) {
-        const parsed = parseAnthropicNonStream((await replayed.json()) as never);
-        console.log(
-          "[heartbeat] prefix replay ok, cache_read =",
-          parsed.usage?.cache_read_input_tokens ?? 0,
-          "cache_creation =",
-          parsed.usage?.cache_creation_input_tokens ?? 0
-        );
-        return new Response(JSON.stringify(parsed.openai), {
-          status: 200,
-          headers: { "content-type": "application/json; charset=utf-8" }
-        });
-      }
-      console.log("[heartbeat] prefix replay upstream error", replayed.status, await replayed.text().catch(() => ""));
+    // 用最近一次真实请求的客户端 body 顶替裸 ping，下方走与真实请求完全
+    // 相同的拼装管线（共用消息模板）：拼装结构随代码演进，心跳前缀永远
+    // 与下一轮真实请求同构。发送前经 makeReplayable 截断到最后锚点并压
+    // max_tokens。无存储时保持裸 ping 旧路径。
+    const storedBody = await loadHeartbeatBody(env, auth.profile.namespace);
+    if (storedBody) {
+      body = { ...storedBody, stream: false };
+      console.log("[heartbeat] rebuilding from stored client body,", body.messages.length, "messages");
     }
   }
 
@@ -152,6 +142,12 @@ export async function handleChatCompletions(
   }
 
   const provider = classifyProvider(targetModel);
+
+  if (isHeartbeat && provider !== "anthropic") {
+    // 缓存保活只对 Anthropic 有意义；万一模型映射改到别家，
+    // 存储的完整历史不该在这里跑出一次全价生成
+    body = { ...body, max_tokens: 8 };
+  }
 
   let visionOutput: string | null = null;
   if (hasImageContent(body) && env.VISION_MODEL) {
@@ -255,6 +251,11 @@ export async function handleChatCompletions(
   let cacheAnchorBlock: string | null = null;
   try {
     if (provider === "anthropic") {
+      if (!isHeartbeat) {
+        // 存客户端原始 body（vision 剥离后、压缩前），不存组装成品：
+        // 心跳重建走同一条管线，结构变更不再搁浅，见 heartbeatPrefix.ts
+        ctx.waitUntil(storeHeartbeatBody(env, auth.profile.namespace, body));
+      }
       if (hasToolContent(assemblerBody)) {
         // Tool messages / tool_calls not yet supported by assembler — fall back
         const anthropicRequest = await buildAnthropicNativeRequest(fallbackBody, {
@@ -264,10 +265,11 @@ export async function handleChatCompletions(
           memories,
           reminders
         });
-        if (!isHeartbeat) {
-          ctx.waitUntil(storeHeartbeatPrefix(env, auth.profile.namespace, targetModel, anthropicRequest));
-        }
-        upstream = await callAnthropicNative(env, anthropicRequest, targetModel);
+        upstream = await callAnthropicNative(
+          env,
+          isHeartbeat ? makeReplayable(anthropicRequest) : anthropicRequest,
+          targetModel
+        );
       } else {
         const assembled = assemble({
           request: assemblerBody,
@@ -284,10 +286,11 @@ export async function handleChatCompletions(
         // as a temporary fallback; native Anthropic image support will be added
         // when the vision pipeline is wired in.
         const anthropicRequest = buildAnthropicRequestFromAssembled(body, targetModel, assembled, env);
-        if (!isHeartbeat) {
-          ctx.waitUntil(storeHeartbeatPrefix(env, auth.profile.namespace, targetModel, anthropicRequest));
-        }
-        upstream = await callAnthropicNative(env, anthropicRequest, targetModel);
+        upstream = await callAnthropicNative(
+          env,
+          isHeartbeat ? makeReplayable(anthropicRequest) : anthropicRequest,
+          targetModel
+        );
       }
     } else {
       if (hasToolContent(assemblerBody)) {
@@ -366,6 +369,15 @@ export async function handleChatCompletions(
 
     const parsed = parseAnthropicNonStream(anthropicParsed as never);
     const anthropicCacheMode = getAnthropicCacheMode(env);
+
+    if (isHeartbeat) {
+      console.log(
+        "[heartbeat] replay ok, cache_read =",
+        parsed.usage?.cache_read_input_tokens ?? 0,
+        "cache_creation =",
+        parsed.usage?.cache_creation_input_tokens ?? 0
+      );
+    }
 
     // 服务端兜底：非流式同样按 tool_use id 暂存签名 thinking 块（与流式路径对齐）。
     // await：写入必须先于客户端携带 tool_result 的下一次请求。
