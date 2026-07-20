@@ -455,7 +455,7 @@ export async function filterAndCompressMemoriesWithMeta(
         : await callWorkersAiFilter(env, prompt, getWorkersAiModel(env) || model, maxTokens);
     if (!output) {
       return {
-        data: [],
+        data: candidates,
         meta: {
           ...activeMeta,
           status: "error",
@@ -468,7 +468,7 @@ export async function filterAndCompressMemoriesWithMeta(
     const items = parseFilteredItems(output);
     if (!items) {
       return {
-        data: [],
+        data: candidates,
         meta: {
           ...activeMeta,
           status: "error",
@@ -491,7 +491,7 @@ export async function filterAndCompressMemoriesWithMeta(
   } catch (error) {
     console.error("memory filter failed", error);
     return {
-      data: [],
+      data: candidates,
       meta: {
         ...activeMeta,
         status: "error",
