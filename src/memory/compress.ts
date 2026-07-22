@@ -80,6 +80,24 @@ export interface CompressResult {
 }
 
 /**
+ * 从 chatMessages 的压缩边界映射回原始消息数组。
+ * 必须从原始数组切片，才能保留边界后的 tool 消息及其配对关系。
+ */
+function sliceRecentFromBoundary(
+  messages: OpenAIChatMessage[],
+  chatMessages: OpenAIChatMessage[],
+  compressEnd: number
+): OpenAIChatMessage[] {
+  const boundaryMessage = chatMessages[compressEnd];
+  if (!boundaryMessage) return [];
+
+  const origStart = messages.indexOf(boundaryMessage);
+  if (origStart < 0) return [];
+
+  return messages.slice(origStart).filter((m) => m.role !== "system");
+}
+
+/**
  * 主入口：检查阈值 → 级联压缩 → 返回裁剪后的消息。
  */
 export async function compressHistoryIfNeeded(
@@ -127,8 +145,7 @@ export async function compressHistoryIfNeeded(
   // recent 从原始数组切片：保留窗口内 tool 消息及其与 assistant tool_calls 的配对。
   // chatMessages[compressEnd] 必为 user/assistant；其之前的 tool 结果属于更早的
   // assistant（随摘要一并丢弃），因此切片内不会出现孤儿 tool_result。
-  const origStart = messages.indexOf(chatMessages[compressEnd]);
-  const recent = messages.slice(origStart).filter(m => m.role !== "system");
+  const recent = sliceRecentFromBoundary(messages, chatMessages, compressEnd);
 
   // -----------------------------------------------------------------------
   // 级联压缩
@@ -188,7 +205,39 @@ export async function compressHistoryIfNeeded(
       segmentsComputed++;
     } catch (error) {
       console.error(`[compress] segment ${seg} failed:`, error);
-      // 压缩失败 → 降级为不压缩
+
+      // 已有前序段摘要时，沿用最后成功结果，并把裁剪边界退回该段末尾。
+      // 失败段及之后的消息保留原文，避免丢消息，也避免整段历史重新上行。
+      const completedSegments = seg - 1;
+      if (summary && completedSegments > 0) {
+        const partialCompressEnd = completedSegments * windowSize;
+        const partialRecent = sliceRecentFromBoundary(
+          messages,
+          chatMessages,
+          partialCompressEnd
+        );
+
+        console.warn(
+          `[compress] using last successful segment ${completedSegments}; ` +
+          `keeping ${partialRecent.length} recent messages until segment ${seg} succeeds`
+        );
+
+        return {
+          summary,
+          messages: [...systemMessages, ...partialRecent],
+          meta: {
+            original_count: chatMessages.length,
+            compressed_count: partialCompressEnd,
+            kept_count: partialRecent.length,
+            cache_hit: false,
+            compress_boundary: partialCompressEnd,
+            total_segments: completeWindows,
+            segments_computed: segmentsComputed,
+          },
+        };
+      }
+
+      // 第一段就失败、没有任何可沿用摘要时，只能保留完整历史。
       return { ...noopResult, meta: { ...noopResult.meta, original_count: chatMessages.length, kept_count: chatMessages.length } };
     }
 
