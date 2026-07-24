@@ -21,6 +21,28 @@
  */
 
 import { strict as assert } from "node:assert";
+import { readFile } from "node:fs/promises";
+import ts from "typescript";
+
+async function importProductionMessagesUtils() {
+  const source = await readFile(new URL("../src/utils/messages.ts", import.meta.url), "utf8");
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+    },
+    fileName: "src/utils/messages.ts",
+    reportDiagnostics: true,
+  });
+  const errors = (transpiled.diagnostics || []).filter(
+    (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error
+  );
+  assert.strictEqual(errors.length, 0, "src/utils/messages.ts must transpile without diagnostics");
+  const url = `data:text/javascript;base64,${Buffer.from(transpiled.outputText).toString("base64")}`;
+  return import(url);
+}
+
+const productionMessagesUtils = await importProductionMessagesUtils();
 
 // ---------------------------------------------------------------------------
 // DJB2 hash — must match src/assembler/blocks.ts simpleHash exactly
@@ -3396,6 +3418,236 @@ check("queue: send failure propagates (no silent swallow in producer)", () => {
     (err) => { assert.strictEqual(err.message, "queue full"); }
   );
 });
+
+// ---------------------------------------------------------------------------
+// Test 19: Tool-result image passthrough
+// Executes the exported production pure functions from src/utils/messages.ts.
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Test 19: Tool-result image passthrough ---");
+
+const {
+  TOOL_IMAGE_OMITTED,
+  contentToAnthropicToolResult: productionToolResultContent,
+  convertToolMessageToAnthropicToolResult: productionToolResult,
+  getLastUserVisionImageParts,
+  hasNonToolVisionImageContent,
+  isStrictBase64,
+  parseToolImagePart: productionToolImage,
+  stripNonToolVisionImages: productionStripNonToolImages,
+} = productionMessagesUtils;
+
+function lastUserVisionImageParts(messages) {
+  return getLastUserVisionImageParts({ model: "test", messages });
+}
+
+check("tool image: text/image/text order is preserved inside tool_result", () => {
+  const block = productionToolResult({
+    role: "tool",
+    tool_call_id: "toolu_photo",
+    content: [
+      { type: "text", text: "before" },
+      { type: "image_url", image_url: { url: "data:image/jpeg;base64,/9j/4AAQ" } },
+      { type: "text", text: "after" },
+    ],
+  });
+  assert.deepStrictEqual(block.content.map((part) => part.type), ["text", "image", "text"]);
+  assert.strictEqual(block.content[0].text, "before");
+  assert.strictEqual(block.content[1].source.media_type, "image/jpeg");
+  assert.strictEqual(block.content[2].text, "after");
+});
+
+check("tool image: input_image string data URL is accepted", () => {
+  const content = productionToolResultContent([
+    { type: "input_image", image_url: "data:image/png;base64,iVBORw0KGgo=" },
+  ]);
+  assert.strictEqual(content[0].type, "image");
+  assert.strictEqual(content[0].source.media_type, "image/png");
+});
+
+check("tool image: native Anthropic base64 block is accepted", () => {
+  const content = productionToolResultContent([
+    { type: "image", source: { type: "base64", media_type: "image/gif", data: "R0lGODlh" } },
+  ]);
+  assert.deepStrictEqual(content[0], {
+    type: "image",
+    source: { type: "base64", media_type: "image/gif", data: "R0lGODlh" },
+  });
+});
+
+check("tool image: JPEG PNG GIF and WebP are the only accepted media types", () => {
+  const fixtures = [
+    ["image/jpeg", "/9j/4AAQ"],
+    ["image/png", "iVBORw0KGgo="],
+    ["image/gif", "R0lGODlh"],
+    ["image/webp", "UklGRg=="],
+  ];
+  for (const [mediaType, data] of fixtures) {
+    const block = productionToolImage({
+      type: "image",
+      source: { type: "base64", media_type: mediaType, data },
+    });
+    assert.strictEqual(block.source.media_type, mediaType);
+  }
+  assert.strictEqual(productionToolImage({
+    type: "image",
+    source: { type: "base64", media_type: "image/svg+xml", data: "PHN2Zz4=" },
+  }), null);
+});
+
+check("tool image: production base64 validator accepts only complete RFC 4648 quanta", () => {
+  for (const valid of ["AAAA", "AAA=", "AA==", "/9j/4AAQ", "iVBORw0KGgo="]) {
+    assert.strictEqual(isStrictBase64(valid), true, `${valid} should be valid`);
+  }
+  for (const invalid of [
+    "",
+    "A=",
+    "AA=",
+    "AAAAAA=",
+    "A===",
+    "====",
+    "AAA==",
+    "AAA",
+    "AA=A",
+    "AAAA\n",
+    "AAAA ",
+  ]) {
+    assert.strictEqual(isStrictBase64(invalid), false, `${JSON.stringify(invalid)} should be invalid`);
+  }
+});
+
+check("tool image: invalid padding in data URLs is safely downgraded", () => {
+  for (const data of ["A=", "AA=", "AAAAAA=", "A===", "AAA=="]) {
+    const content = productionToolResultContent([
+      { type: "image_url", image_url: { url: `data:image/jpeg;base64,${data}` } },
+    ]);
+    assert.deepStrictEqual(content, [{ type: "text", text: TOOL_IMAGE_OMITTED }]);
+  }
+});
+
+check("tool image: remote and local URLs downgrade without retaining the URL", () => {
+  for (const url of [
+    "https://example.com/private.jpg",
+    "http://127.0.0.1/internal.jpg",
+    "file:///tmp/private.jpg",
+    "content://media/external/images/1",
+  ]) {
+    const content = productionToolResultContent([{ type: "image_url", image_url: { url } }]);
+    assert.deepStrictEqual(content, [{ type: "text", text: TOOL_IMAGE_OMITTED }]);
+    assert.strictEqual(JSON.stringify(content).includes(url), false);
+  }
+});
+
+check("tool image: malformed data is replaced without leaking the payload", () => {
+  const invalid = "data:image/jpeg;base64,%%%very-large-secret%%%";
+  const content = productionToolResultContent([{ type: "image_url", image_url: { url: invalid } }]);
+  assert.deepStrictEqual(content, [{ type: "text", text: TOOL_IMAGE_OMITTED }]);
+  assert.strictEqual(JSON.stringify(content).includes("very-large-secret"), false);
+});
+
+check("tool image: tool_call_id remains the exact tool_use_id", () => {
+  const block = productionToolResult({ role: "tool", tool_call_id: "toolu_exact_123", content: "ok" });
+  assert.strictEqual(block.tool_use_id, "toolu_exact_123");
+});
+
+check("tool image: consecutive tool results preserve order and pairing", () => {
+  const messages = [
+    { role: "tool", tool_call_id: "toolu_1", content: "first" },
+    { role: "tool", tool_call_id: "toolu_2", content: "second" },
+  ];
+  const blocks = messages.map(productionToolResult);
+  assert.deepStrictEqual(blocks.map((block) => block.tool_use_id), ["toolu_1", "toolu_2"]);
+  assert.deepStrictEqual(blocks.map((block) => block.content), ["first", "second"]);
+});
+
+check("vision split: tool-only image does not select images for the small vision model", () => {
+  const messages = [
+    { role: "assistant", content: null, tool_calls: [{ id: "toolu_photo" }] },
+    {
+      role: "tool",
+      tool_call_id: "toolu_photo",
+      content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64,/9j/4AAQ" } }],
+    },
+  ];
+  assert.deepStrictEqual(lastUserVisionImageParts(messages), []);
+  assert.strictEqual(hasNonToolVisionImageContent({ model: "test", messages }), false);
+});
+
+check("vision split: current user image still goes through vision and is stripped", () => {
+  const messages = [{
+    role: "user",
+    content: [
+      { type: "text", text: "请描述" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+    ],
+  }];
+  assert.strictEqual(lastUserVisionImageParts(messages).length, 1);
+  assert.strictEqual(productionStripNonToolImages(messages)[0].content, "请描述");
+});
+
+check("vision split: all non-tool images are stripped while tool content remains unchanged", () => {
+  const toolContent = [
+    { type: "text", text: "photo" },
+    { type: "image_url", image_url: { url: "data:image/jpeg;base64,/9j/4AAQ" } },
+  ];
+  const messages = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "history user" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "history assistant" },
+        { type: "input_image", image_url: "data:image/png;base64,iVBORw0KGgo=" },
+      ],
+    },
+    { role: "tool", tool_call_id: "toolu_photo", content: toolContent },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "compare" },
+        { type: "input_image", image_url: "data:image/png;base64,iVBORw0KGgo=" },
+      ],
+    },
+  ];
+  const selected = lastUserVisionImageParts(messages);
+  assert.strictEqual(selected.length, 1);
+  assert.strictEqual(selected[0], messages[3].content[1]);
+  assert.strictEqual(hasNonToolVisionImageContent({ model: "test", messages }), true);
+
+  const stripped = productionStripNonToolImages(messages);
+  assert.strictEqual(stripped[0].content, "history user");
+  assert.strictEqual(stripped[1].content, "history assistant");
+  assert.strictEqual(stripped[2], messages[2]);
+  assert.strictEqual(stripped[2].content, toolContent);
+  assert.strictEqual(stripped[3].content, "compare");
+});
+
+check("vision split: historical-only non-tool images still trigger the existing strip path", () => {
+  const messages = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "history" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+      ],
+    },
+    { role: "user", content: "current text only" },
+  ];
+  assert.deepStrictEqual(lastUserVisionImageParts(messages), []);
+  assert.strictEqual(hasNonToolVisionImageContent({ model: "test", messages }), true);
+  const stripped = productionStripNonToolImages(messages);
+  assert.strictEqual(stripped[0].content, "history");
+  assert.strictEqual(stripped[1].content, "current text only");
+});
+
+// Cache placement, heartbeat truncation, and compression production code are
+// unchanged by this feature. Their invariants are guarded by static review and
+// the repository's existing cache/compression verification sections above.
 
 // ---------------------------------------------------------------------------
 // Summary

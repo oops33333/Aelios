@@ -6,6 +6,10 @@ import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAI
 import { formatMemoryPatch, formatRemindersBlock } from "../memory/inject";
 import { normalizeAiGatewayBaseUrl } from "./openaiAdapter";
 import { getStashedThinking } from "./thinkingStash";
+import {
+  convertToolMessageToAnthropicToolResult,
+  type AnthropicToolResultContentBlock
+} from "../utils/messages";
 
 interface AnthropicCacheControl {
   type: "ephemeral";
@@ -35,7 +39,7 @@ interface AnthropicToolUseBlock {
 interface AnthropicToolResultBlock {
   type: "tool_result";
   tool_use_id: string;
-  content?: string | Array<{ type: "text"; text: string }>;
+  content?: string | AnthropicToolResultContentBlock[];
   is_error?: boolean;
   cache_control?: AnthropicCacheControl;
 }
@@ -542,11 +546,7 @@ export function convertMessages(messages: OpenAIChatMessage[]): AnthropicMessage
     if (message.role === "system") continue;
 
     if (message.role === "tool") {
-      const block: AnthropicToolResultBlock = {
-        type: "tool_result",
-        tool_use_id: typeof message.tool_call_id === "string" ? message.tool_call_id : "",
-        content: contentToText(message.content)
-      };
+      const block: AnthropicToolResultBlock = convertToolMessageToAnthropicToolResult(message);
       pushBlocks("user", [block]);
       continue;
     }

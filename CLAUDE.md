@@ -20,7 +20,8 @@ aelios 是跑在 Cloudflare Workers 上的私人聊天代理：对客户端（Ri
 
 ```
 客户端请求 (OpenAI 格式)
-  → vision 剥离（图片转述后除去 image 块）
+  → vision 剥离（最后 user 图片由小模型转述；所有 non-tool 图片照旧移除，
+    tool 图片原位保留）
   → [此处存心跳原料 body → D1]（仅 anthropic 分支、非心跳轮）
   → 并行取数：压缩(compressHistoryIfNeeded) / RAG记忆 / persona / summary / reminders
   → 路径判定 hasToolContent(裁剪后消息)：
@@ -117,6 +118,9 @@ client_system → persona_pinned → long_term_summary → proxy_static_rules
 - RikkaHub 不回传 thinking_blocks；服务端按 tool_use id 在 D1 暂存带签名
   thinking 块，工具回环轮回填，保 thinking 常开（开关横跳会打掉消息级缓存）。
 - 流式与非流式两条返回路径的暂存逻辑必须保持对齐。
+- `role:"tool"` 的 base64 图片只允许留在对应 `tool_result.content` 内；不得
+  新建消息、移动 `tool_result`、改变 `tool_use_id` 配对或缓存锚点。用户主动
+  发送的图片仍走既有小视觉模型描述链路。
 
 ## 七、开发与部署规范
 

@@ -28,7 +28,11 @@ import { CONTENT_RULES } from "../preset/regexRules";
 import { applyRegexRules } from "../preset/regexPipeline";
 import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { openAiError } from "../utils/json";
-import { hasImageContent } from "../utils/messages";
+import {
+  getLastUserVisionImageParts,
+  hasNonToolVisionImageContent,
+  stripNonToolVisionImages
+} from "../utils/messages";
 
 function extractAssistantText(response: OpenAIChatResponse): string {
   const message = response.choices?.[0]?.message;
@@ -150,43 +154,33 @@ export async function handleChatCompletions(
   }
 
   let visionOutput: string | null = null;
-  if (hasImageContent(body) && env.VISION_MODEL) {
-    const lastUserMsg = [...body.messages].reverse().find(m => m.role === "user");
-    if (lastUserMsg && Array.isArray(lastUserMsg.content)) {
-      const imageParts = (lastUserMsg.content as Array<Record<string, unknown>>).filter(
-        p => p.type === "image_url" || p.type === "input_image"
-      );
-      if (imageParts.length > 0) {
-        try {
-          const visionRes = await callOpenAICompat(env, {
-            model: env.VISION_MODEL,
-            messages: [
-              { role: "system", content: "你是图片描述工具。如实、详细地描述图片中看到的所有内容：物体、人物、场景、文字、颜色、布局。只输出描述本身，不要加任何分析、解读、评论或开场白。" },
-              { role: "user", content: [{ type: "text", text: "请描述这张图片。" }, ...imageParts] },
-            ],
-            max_tokens: 500,
-            stream: false,
-          } as OpenAIChatRequest);
-          if (visionRes.ok) {
-            const vd = await visionRes.json() as { choices?: Array<{ message?: { content?: string } }> };
-            visionOutput = vd?.choices?.[0]?.message?.content || null;
-            console.log("[vision] output:", visionOutput ? visionOutput.slice(0, 80) + "..." : "empty");
-          } else {
-            console.log("[vision] error status:", visionRes.status, await visionRes.text().catch(() => ""));
-          }
-        } catch (e) {
-          console.log("[vision] exception:", e instanceof Error ? e.message : e);
+  const userImageParts = getLastUserVisionImageParts(body);
+  if (hasNonToolVisionImageContent(body) && env.VISION_MODEL) {
+    if (userImageParts.length > 0) {
+      try {
+        const visionRes = await callOpenAICompat(env, {
+          model: env.VISION_MODEL,
+          messages: [
+            { role: "system", content: "你是图片描述工具。如实、详细地描述图片中看到的所有内容：物体、人物、场景、文字、颜色、布局。只输出描述本身，不要加任何分析、解读、评论或开场白。" },
+            { role: "user", content: [{ type: "text", text: "请描述这张图片。" }, ...userImageParts] },
+          ],
+          max_tokens: 500,
+          stream: false,
+        } as OpenAIChatRequest);
+        if (visionRes.ok) {
+          const vd = await visionRes.json() as { choices?: Array<{ message?: { content?: string } }> };
+          visionOutput = vd?.choices?.[0]?.message?.content || null;
+          console.log("[vision] output:", visionOutput ? visionOutput.slice(0, 80) + "..." : "empty");
+        } else {
+          console.log("[vision] error status:", visionRes.status, await visionRes.text().catch(() => ""));
         }
+      } catch (e) {
+        console.log("[vision] exception:", e instanceof Error ? e.message : e);
       }
     }
     body = {
       ...body,
-      messages: body.messages.map(m => {
-        if (!Array.isArray(m.content)) return m;
-        const texts = (m.content as Array<Record<string, unknown>>).filter(p => p.type !== "image_url" && p.type !== "input_image");
-        if (texts.length === 1 && texts[0].type === "text") return { ...m, content: texts[0].text as string };
-        return { ...m, content: texts.length > 0 ? texts : "" };
-      }),
+      messages: stripNonToolVisionImages(body.messages),
     };
     if (visionOutput) {
       const visionTag = `\n\n<vision_context>\n用户发送了一张图片。以下是图片的描述：\n${visionOutput}\n</vision_context>`;
@@ -194,7 +188,11 @@ export async function handleChatCompletions(
       for (let i = msgs.length - 1; i >= 0; i--) {
         if (msgs[i].role === "user") {
           const cur = msgs[i].content;
-          msgs[i] = { ...msgs[i], content: (typeof cur === "string" ? cur : "") + visionTag };
+          if (Array.isArray(cur)) {
+            msgs[i] = { ...msgs[i], content: [...cur, { type: "text", text: visionTag }] };
+          } else {
+            msgs[i] = { ...msgs[i], content: (typeof cur === "string" ? cur : "") + visionTag };
+          }
           break;
         }
       }

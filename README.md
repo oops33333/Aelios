@@ -567,8 +567,13 @@ Dimensions:  768 (如覆盖 EMBEDDING_MODEL，输出维度仍需匹配)
 用户传 model=companion
   -> resolveTargetModel -> CHAT_MODEL
 
-请求含 image_url/input_image
-  -> VISION_MODEL
+当前 user 消息含 image_url/input_image
+  -> 最后一条 user 的图片交给 VISION_MODEL 描述
+  -> 沿用既有策略剥离历史 user、assistant 和当前 user 的所有 non-tool 图片
+
+role=tool 的结果含 data:image/{jpeg,png,gif,webp};base64 图片
+  -> 保持在原 tool_result.content 位置
+  -> Anthropic native image/base64（不经过 VISION_MODEL，不代理抓取 URL）
 
 目标模型名含 anthropic 或 claude
   -> Anthropic native: <AI_GATEWAY_BASE_URL>/anthropic/v1/messages
@@ -623,7 +628,12 @@ messages:
 
 动态记忆 `dynamic_memory_patch` 在 assembler 里仍是独立 block；走 Anthropic native 时，会从 `system` 里摘出来，追加到当前 user 内容块末尾。这样 Claude 能看到本轮召回的记忆，但它不会出现在 system cache 或历史 rolling cache 的前缀里。
 
-tool/tool_calls 请求 fallback 到旧路径，assembler 不处理 tool。
+tool/tool_calls 请求 fallback 到旧路径，assembler 不处理 tool。工具结果中的
+base64 图片由该路径原位转换为 Anthropic `tool_result.content` 内的 `image`
+块；外层 `tool_result` 的顺序、`tool_use_id` 配对和 rolling
+`cache_control` 位置保持不变。HTTP(S)、`file://`、`content://` 图片地址不会
+由 Aelios 获取。Base64 必须是无空白、长度为 4 的倍数且 padding 只出现在
+末尾的标准 RFC 4648 形式；空数据或非法 padding 会安全降级。
 
 ### Regex / 输出过滤
 
