@@ -75,6 +75,11 @@ export interface AnthropicRequest {
     type: "enabled";
     budget_tokens: number;
     display?: "summarized" | "omitted";
+  } | {
+    type: "adaptive";
+  };
+  output_config?: {
+    effort: "low" | "medium" | "high" | "max";
   };
   tools?: AnthropicTool[];
   tool_choice?: AnthropicToolChoice;
@@ -279,6 +284,17 @@ function stripAnthropicModelPrefix(model: string): string {
   return parseCustomProviderModel(model)?.model || stripAnthropicProviderPrefix(model);
 }
 
+/**
+ * Adaptive thinking is an explicit model capability, not a provider-wide
+ * default. Normalize gateway/provider prefixes first, then match only the
+ * known Claude 4.6 families so older models retain the enabled+budget wire
+ * format.
+ */
+function supportsAdaptiveThinking(model: string): boolean {
+  const canonical = stripAnthropicModelPrefix(model).trim().toLowerCase();
+  return /^claude-(?:opus|sonnet)-4-6(?:$|-)/.test(canonical);
+}
+
 function getCustomAnthropicMessagesPath(env: Env): string {
   return (env.CUSTOM_ANTHROPIC_MESSAGES_PATH || "messages").replace(/^\/+/, "");
 }
@@ -401,21 +417,55 @@ function parseBooleanLike(value: unknown): boolean | null {
   return null;
 }
 
-function budgetFromReasoningEffort(value: unknown): number | null {
+type ThinkingEffort = NonNullable<AnthropicRequest["output_config"]>["effort"];
+
+function normalizeThinkingEffort(value: unknown): ThinkingEffort | null {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
-  if (["none", "off", "disabled", "disable"].includes(normalized)) return 0;
-  if (["minimal", "low"].includes(normalized)) return 1024;
-  if (["medium", "auto"].includes(normalized)) return 2048;
-  if (normalized === "high") return 4096;
-  if (["xhigh", "extra_high"].includes(normalized)) return 8192;
+  if (["minimal", "low"].includes(normalized)) return "low";
+  if (["medium", "auto"].includes(normalized)) return "medium";
+  if (normalized === "high") return "high";
+  if (["max", "xhigh", "extra_high"].includes(normalized)) return "max";
   return null;
 }
 
-function readThinkingDirective(source: Record<string, unknown>): { enabled?: boolean; budget?: number } {
-  const effortBudget = budgetFromReasoningEffort(source.reasoning_effort);
-  if (effortBudget === 0) return { enabled: false };
-  if (effortBudget && effortBudget > 0) return { enabled: true, budget: effortBudget };
+function normalizeOutputConfigEffort(value: unknown): ThinkingEffort | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return ["low", "medium", "high", "max"].includes(normalized)
+    ? normalized as ThinkingEffort
+    : null;
+}
+
+function budgetFromThinkingEffort(effort: ThinkingEffort): number {
+  if (effort === "low") return 1024;
+  if (effort === "medium") return 2048;
+  if (effort === "high") return 4096;
+  return 8192;
+}
+
+function effortFromThinkingBudget(budget: number): ThinkingEffort {
+  if (budget <= 1024) return "low";
+  if (budget <= 2048) return "medium";
+  if (budget <= 4096) return "high";
+  return "max";
+}
+
+interface ThinkingDirective {
+  enabled?: boolean;
+  budget?: number;
+  effort?: ThinkingEffort;
+}
+
+function readThinkingDirective(source: Record<string, unknown>): ThinkingDirective {
+  if (
+    typeof source.reasoning_effort === "string" &&
+    ["none", "off", "disabled", "disable"].includes(source.reasoning_effort.trim().toLowerCase())
+  ) {
+    return { enabled: false };
+  }
+  const effort = normalizeThinkingEffort(source.reasoning_effort);
+  if (effort) return { enabled: true, budget: budgetFromThinkingEffort(effort), effort };
 
   const enableThinking = parseBooleanLike(source.enable_thinking);
   if (enableThinking !== null) {
@@ -437,6 +487,19 @@ function readThinkingDirective(source: Record<string, unknown>): { enabled?: boo
   if (isRecord(thinking)) {
     const type = typeof thinking.type === "string" ? thinking.type.trim().toLowerCase() : "";
     if (["disabled", "off", "none"].includes(type)) return { enabled: false };
+    if (type === "adaptive") {
+      const outputEffort = isRecord(source.output_config)
+        ? normalizeOutputConfigEffort(source.output_config.effort)
+        : null;
+      const budget = clampThinkingBudget(
+        thinking.budget_tokens ?? thinking.budget ?? source.thinking_budget
+      );
+      return {
+        enabled: true,
+        budget: budget ?? (outputEffort ? budgetFromThinkingEffort(outputEffort) : undefined),
+        effort: outputEffort ?? undefined
+      };
+    }
     const budget = clampThinkingBudget(thinking.budget_tokens ?? thinking.budget ?? source.thinking_budget);
     if (type === "enabled" || budget) return { enabled: true, budget: budget ?? undefined };
   }
@@ -453,10 +516,11 @@ function readThinkingDirective(source: Record<string, unknown>): { enabled?: boo
   if (isRecord(reasoning)) {
     const enabled = parseBooleanLike(reasoning.enabled);
     if (enabled === false) return { enabled: false };
+    const effort = normalizeThinkingEffort(reasoning.effort);
     const budget =
       clampThinkingBudget(reasoning.budget_tokens ?? reasoning.budget ?? source.reasoning_budget) ??
-      budgetFromReasoningEffort(reasoning.effort);
-    if (enabled === true || (budget && budget > 0)) return { enabled: true, budget: budget ?? undefined };
+      (effort ? budgetFromThinkingEffort(effort) : null);
+    if (enabled === true || budget) return { enabled: true, budget: budget ?? undefined, effort: effort ?? undefined };
   }
 
   const budget = clampThinkingBudget(source.thinking_budget ?? source.reasoning_budget ?? source.budget_tokens);
@@ -465,7 +529,7 @@ function readThinkingDirective(source: Record<string, unknown>): { enabled?: boo
   return {};
 }
 
-function getRequestThinkingDirective(req: OpenAIChatRequest): { enabled?: boolean; budget?: number } {
+function getRequestThinkingDirective(req: OpenAIChatRequest): ThinkingDirective {
   for (const source of [req, isRecord(req.extra_body) ? req.extra_body : null, isRecord(req.extraBody) ? req.extraBody : null]) {
     if (!source) continue;
     const directive = readThinkingDirective(source);
@@ -475,24 +539,44 @@ function getRequestThinkingDirective(req: OpenAIChatRequest): { enabled?: boolea
   return {};
 }
 
-function buildThinkingConfig(env: Env, req: OpenAIChatRequest): AnthropicRequest["thinking"] | undefined {
-  if (env.ANTHROPIC_THINKING_ENABLED === "false") return undefined;
-  const requestDirective = getRequestThinkingDirective(req);
-  if (requestDirective.enabled === false) return undefined;
+interface ThinkingConfig {
+  thinking?: AnthropicRequest["thinking"];
+  outputConfig?: AnthropicRequest["output_config"];
+}
 
+function buildThinkingConfig(
+  env: Env,
+  req: OpenAIChatRequest,
+  targetModel: string
+): ThinkingConfig {
+  if (env.ANTHROPIC_THINKING_ENABLED === "false") return {};
+  const requestDirective = getRequestThinkingDirective(req);
+  if (requestDirective.enabled === false) return {};
+
+  let budget: number | undefined;
   if (requestDirective.enabled === true || requestDirective.budget) {
+    budget = requestDirective.budget ?? getEnvThinkingBudget(env);
+  } else if (env.ANTHROPIC_THINKING_ENABLED === "true") {
+    budget = getEnvThinkingBudget(env);
+  } else {
+    return {};
+  }
+
+  if (supportsAdaptiveThinking(targetModel)) {
     return {
-      type: "enabled",
-      budget_tokens: requestDirective.budget ?? getEnvThinkingBudget(env),
-      display: "summarized"
+      thinking: { type: "adaptive" },
+      outputConfig: {
+        effort: requestDirective.effort ?? effortFromThinkingBudget(budget)
+      }
     };
   }
 
-  if (env.ANTHROPIC_THINKING_ENABLED !== "true") return undefined;
   return {
-    type: "enabled",
-    budget_tokens: getEnvThinkingBudget(env),
-    display: "summarized"
+    thinking: {
+      type: "enabled",
+      budget_tokens: budget,
+      display: "summarized"
+    }
   };
 }
 
@@ -503,6 +587,7 @@ function getAnthropicMaxTokens(
 ): number {
   const maxTokens = getMaxTokens(req);
   if (!thinking) return maxTokens;
+  if (thinking.type === "adaptive") return maxTokens;
   return Math.max(maxTokens, thinking.budget_tokens + Math.min(Math.max(maxTokens, 256), 4096));
 }
 
@@ -695,7 +780,8 @@ export async function buildAnthropicNativeRequest(
   ];
 
   const messages = convertMessages(req.messages);
-  let thinking = buildThinkingConfig(input.env, req);
+  const thinkingConfig = buildThinkingConfig(input.env, req, input.targetModel);
+  let thinking = thinkingConfig.thinking;
   if (thinking && !(await restoreSignedThinkingForToolHistory(input.env.DB, input.namespace, messages))) {
     thinking = undefined;
   }
@@ -712,6 +798,7 @@ export async function buildAnthropicNativeRequest(
     temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
     thinking,
+    output_config: thinking?.type === "adaptive" ? thinkingConfig.outputConfig : undefined,
     tools: convertOpenAITools(req),
     tool_choice: convertOpenAIToolChoice(req, Boolean(thinking)),
     system,
@@ -738,7 +825,8 @@ export function buildAnthropicRequestFromAssembled(
   assembled: AssembledPrompt,
   env: Env
 ): AnthropicRequest {
-  const thinking = buildThinkingConfig(env, req);
+  const thinkingConfig = buildThinkingConfig(env, req, targetModel);
+  const thinking = thinkingConfig.thinking;
   const { systemBlocks, volatileContext, dynamicMemoryPatch, reminders } = splitDynamicSystemBlocks(assembled);
   const system = assembledToAnthropicSystem(systemBlocks);
   const messages = assembledToAnthropicMessages(assembled.messages);
@@ -756,6 +844,7 @@ export function buildAnthropicRequestFromAssembled(
     temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
     thinking,
+    output_config: thinkingConfig.outputConfig,
     tools: convertOpenAITools(req),
     tool_choice: convertOpenAIToolChoice(req, Boolean(thinking)),
     system,

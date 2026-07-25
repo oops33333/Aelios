@@ -140,16 +140,19 @@ function appendReplayNote(messages: AnthropicMessage[]): AnthropicMessage[] {
  * 管线组装完毕、发往上游前对心跳请求做三处最小覆盖：
  * ① 截断到最后一个 cache_control 锚点（锚点后按全价重算，去掉）；
  * ② stream=false（心跳走非流式解析）；
- * ③ max_tokens 压到最小——thinking 开启时 API 要求
- *    max_tokens > budget_tokens，取 budget+1，否则为 1；
+ * ③ max_tokens 压到最小——旧式 enabled thinking 要求
+ *    max_tokens > budget_tokens，取 budget+1；adaptive 没有显式 budget，
+ *    与关闭 thinking 时一样取 1；
  *    并在锚点后追加收尾指令让模型少想少答，省 thinking 输出费。
  */
 export function makeReplayable(request: AnthropicRequest): AnthropicRequest {
   const truncated = truncateToLastAnchor(request);
+  const legacyThinkingBudget =
+    truncated.thinking?.type === "enabled" ? truncated.thinking.budget_tokens : null;
   return {
     ...truncated,
     stream: false,
-    max_tokens: truncated.thinking ? truncated.thinking.budget_tokens + 1 : 1,
+    max_tokens: legacyThinkingBudget !== null ? legacyThinkingBudget + 1 : 1,
     messages: appendReplayNote(truncated.messages)
   };
 }
