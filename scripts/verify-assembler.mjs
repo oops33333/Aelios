@@ -1473,8 +1473,21 @@ function stripAnthropicModelPrefix(model) {
   return custom?.[2] || model.replace(/^anthropic\//i, "");
 }
 
+function getCanonicalAnthropicModel(model) {
+  return stripAnthropicModelPrefix(model).trim().toLowerCase();
+}
+
+function isCanonicalOpus46(model) {
+  return getCanonicalAnthropicModel(model) === "claude-opus-4-6";
+}
+
+function isOpus5(model) {
+  return /^claude-opus-5(?:$|-[a-z0-9]+(?:-[a-z0-9]+)*)$/.test(getCanonicalAnthropicModel(model));
+}
+
 function supportsAdaptiveThinking(model) {
-  return /^claude-(?:opus|sonnet)-4-6(?:$|-)/.test(stripAnthropicModelPrefix(model).trim().toLowerCase());
+  const canonical = getCanonicalAnthropicModel(model);
+  return /^claude-(?:opus|sonnet)-4-6(?:$|-)/.test(canonical) && !isCanonicalOpus46(model);
 }
 
 function normalizeThinkingEffort(value) {
@@ -1483,18 +1496,19 @@ function normalizeThinkingEffort(value) {
   if (["minimal", "low"].includes(normalized)) return "low";
   if (["medium", "auto"].includes(normalized)) return "medium";
   if (normalized === "high") return "high";
-  if (["max", "xhigh", "extra_high"].includes(normalized)) return "max";
+  if (["xhigh", "extra_high"].includes(normalized)) return "xhigh";
+  if (normalized === "max") return "max";
   return null;
 }
 
 function normalizeOutputConfigEffort(value) {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
-  return ["low", "medium", "high", "max"].includes(normalized) ? normalized : null;
+  return ["low", "medium", "high", "xhigh", "max"].includes(normalized) ? normalized : null;
 }
 
 function budgetFromThinkingEffort(effort) {
-  return { low: 1024, medium: 2048, high: 4096, max: 8192 }[effort];
+  return { low: 1024, medium: 2048, high: 4096, xhigh: 8192, max: 8192 }[effort];
 }
 
 function effortFromThinkingBudget(budget) {
@@ -1586,8 +1600,26 @@ function getRequestThinkingDirective(req) {
 }
 
 function buildThinkingConfig(env, req, targetModel) {
-  if (env.ANTHROPIC_THINKING_ENABLED === "false") return {};
   const requestDirective = getRequestThinkingDirective(req);
+  if (isOpus5(targetModel)) {
+    if (env.ANTHROPIC_THINKING_ENABLED === "false" || requestDirective.enabled === false) {
+      return { thinking: { type: "disabled" } };
+    }
+    const explicitlyEnabled =
+      requestDirective.enabled === true ||
+      requestDirective.budget !== undefined ||
+      env.ANTHROPIC_THINKING_ENABLED === "true";
+    if (!explicitlyEnabled) {
+      return { thinking: { type: "adaptive", display: "summarized" } };
+    }
+    const budget = requestDirective.budget ?? getThinkingBudget(env);
+    return {
+      thinking: { type: "adaptive", display: "summarized" },
+      outputConfig: { effort: requestDirective.effort ?? effortFromThinkingBudget(budget) },
+    };
+  }
+
+  if (env.ANTHROPIC_THINKING_ENABLED === "false") return {};
   if (requestDirective.enabled === false) return {};
   let budget;
   if (requestDirective.enabled === true || requestDirective.budget) {
@@ -1611,7 +1643,7 @@ function buildThinkingConfig(env, req, targetModel) {
 function getAnthropicMaxTokens(req, thinking) {
   const maxTokens = typeof req.max_tokens === "number" ? Math.max(Math.floor(req.max_tokens), 1) : 1024;
   if (!thinking) return maxTokens;
-  if (thinking.type === "adaptive") return maxTokens;
+  if (thinking.type !== "enabled") return maxTokens;
   return Math.max(maxTokens, thinking.budget_tokens + Math.min(Math.max(maxTokens, 256), 4096));
 }
 
@@ -1693,7 +1725,9 @@ function buildAnthropicRequestFromAssembled(req, targetModel, assembled, env) {
     model: stripAnthropicModelPrefix(targetModel),
     max_tokens: getAnthropicMaxTokens(req, thinking),
     cache_control: buildAutomaticCacheControl(env),
-    temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
+    temperature: isOpus5(targetModel) || (thinking && thinking.type !== "disabled")
+      ? undefined
+      : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
     thinking,
     output_config: thinkingConfig.outputConfig,
@@ -2132,17 +2166,38 @@ check("Claude 4.6 uses adaptive thinking and output_config effort", () => {
   assert.strictEqual(req.max_tokens, 256, "adaptive thinking must not inflate max_tokens from a synthetic budget");
 });
 
-check("custom provider Claude 4.6 model is normalized before adaptive capability check", () => {
+check("canonical custom-provider Opus 4.6 retains legacy budget thinking", () => {
   const assembled = assemble(makeBaseCtx());
   const req = buildAnthropicRequestFromAssembled(
     { model: "companion", messages: [], extra_body: { thinking: { type: "enabled", budget_tokens: 3072 } } },
-    "custom-bedrock/claude-opus-4-6-20260701",
+    "custom-bedrock/claude-opus-4-6",
     assembled,
     {}
   );
-  assert.strictEqual(req.model, "claude-opus-4-6-20260701");
-  assert.deepStrictEqual(req.thinking, { type: "adaptive" });
-  assert.deepStrictEqual(req.output_config, { effort: "high" });
+  assert.strictEqual(req.model, "claude-opus-4-6");
+  assert.deepStrictEqual(req.thinking, {
+    type: "enabled",
+    budget_tokens: 3072,
+    display: "summarized",
+  });
+  assert.strictEqual(req.output_config, undefined);
+  assert.ok(req.max_tokens > req.thinking.budget_tokens);
+});
+
+check("canonical Opus 4.6 mirror maps xhigh to legacy budget 8192", () => {
+  const req = buildAnthropicRequestFromAssembled(
+    { model: "companion", messages: [], max_tokens: 1, reasoning_effort: "xhigh" },
+    "anthropic/claude-opus-4-6",
+    assemble(makeBaseCtx()),
+    {}
+  );
+  assert.deepStrictEqual(req.thinking, {
+    type: "enabled",
+    budget_tokens: 8192,
+    display: "summarized",
+  });
+  assert.strictEqual(req.output_config, undefined);
+  assert.ok(req.max_tokens > 8192);
 });
 
 check("explicit thinking budgets retain strength semantics across old and adaptive models", () => {
@@ -2179,6 +2234,48 @@ check("ANTHROPIC_THINKING_ENABLED=false disables adaptive thinking globally", ()
   assert.strictEqual(req.thinking, undefined);
   assert.strictEqual(req.output_config, undefined);
   assert.strictEqual(req.temperature, 0.4);
+});
+
+check("Opus 5 is default-on without inventing effort and never forwards temperature", () => {
+  const req = buildAnthropicRequestFromAssembled(
+    { model: "companion", messages: [], max_tokens: 1, temperature: 0.4 },
+    "anthropic/claude-opus-5",
+    assemble(makeBaseCtx()),
+    {}
+  );
+  assert.deepStrictEqual(req.thinking, { type: "adaptive", display: "summarized" });
+  assert.strictEqual(req.output_config, undefined);
+  assert.strictEqual(req.max_tokens, 1);
+  assert.strictEqual(req.temperature, undefined);
+});
+
+check("Opus 5 explicit xhigh remains distinct and valid suffixed models stay adaptive", () => {
+  const req = buildAnthropicRequestFromAssembled(
+    { model: "companion", messages: [], max_tokens: 1, reasoning_effort: "xhigh" },
+    "custom-bedrock/claude-opus-5-20260725",
+    assemble(makeBaseCtx()),
+    {}
+  );
+  assert.deepStrictEqual(req.thinking, { type: "adaptive", display: "summarized" });
+  assert.deepStrictEqual(req.output_config, { effort: "xhigh" });
+  assert.strictEqual(req.max_tokens, 1);
+});
+
+check("Opus 5 explicit and environment disable emit thinking disabled", () => {
+  for (const [request, env] of [
+    [{ model: "companion", messages: [], max_tokens: 1, thinking: false }, {}],
+    [{ model: "companion", messages: [], max_tokens: 1 }, { ANTHROPIC_THINKING_ENABLED: "false" }],
+  ]) {
+    const req = buildAnthropicRequestFromAssembled(
+      request,
+      "anthropic/claude-opus-5",
+      assemble(makeBaseCtx()),
+      env
+    );
+    assert.deepStrictEqual(req.thinking, { type: "disabled" });
+    assert.strictEqual(req.output_config, undefined);
+    assert.strictEqual(req.max_tokens, 1);
+  }
 });
 
 check("adaptive change preserves client input and all unrelated request/cache structure", () => {
@@ -2262,13 +2359,11 @@ function makeReplayableMirror(request) {
   };
 }
 
-check("heartbeat adaptive replay remains finite and preserves cache/output protocol", () => {
+check("heartbeat Opus 5 adaptive/default/disabled replay at max_tokens=1", () => {
   const request = {
-    model: "claude-sonnet-4-6",
+    model: "claude-opus-5",
     max_tokens: 4096,
     stream: true,
-    thinking: { type: "adaptive" },
-    output_config: { effort: "high" },
     system: [{ type: "text", text: "stable", cache_control: { type: "ephemeral" } }],
     messages: [{
       role: "user",
@@ -2278,19 +2373,25 @@ check("heartbeat adaptive replay remains finite and preserves cache/output proto
       ],
     }],
   };
-  const replay = makeReplayableMirror(request);
-  assert.strictEqual(replay.max_tokens, 1);
-  assert.ok(Number.isFinite(replay.max_tokens));
-  assert.deepStrictEqual(replay.thinking, { type: "adaptive" });
-  assert.deepStrictEqual(replay.output_config, { effort: "high" });
-  assert.strictEqual(replay.messages[0].content[0].text, "cached");
-  assert.strictEqual(replay.messages[0].content[0].cache_control.type, "ephemeral");
-  assert.ok(!replay.messages[0].content.some((block) => block.text === "volatile"));
+  for (const protocol of [
+    { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "high" } },
+    { thinking: { type: "adaptive", display: "summarized" } },
+    { thinking: { type: "disabled" } },
+  ]) {
+    const replay = makeReplayableMirror({ ...request, ...protocol });
+    assert.strictEqual(replay.max_tokens, 1);
+    assert.ok(Number.isFinite(replay.max_tokens));
+    assert.deepStrictEqual(replay.thinking, protocol.thinking);
+    assert.deepStrictEqual(replay.output_config, protocol.output_config);
+    assert.strictEqual(replay.messages[0].content[0].text, "cached");
+    assert.strictEqual(replay.messages[0].content[0].cache_control.type, "ephemeral");
+    assert.ok(!replay.messages[0].content.some((block) => block.text === "volatile"));
+  }
 });
 
-check("heartbeat legacy replay still uses budget+1", () => {
+check("heartbeat canonical Opus 4.6 legacy replay uses budget+1", () => {
   const replay = makeReplayableMirror({
-    model: "claude-sonnet-4-5",
+    model: "claude-opus-4-6",
     max_tokens: 4096,
     thinking: { type: "enabled", budget_tokens: 2048, display: "summarized" },
     system: [],
@@ -2315,88 +2416,145 @@ function makeProductionAssembledFixture() {
   };
 }
 
-check("production adapter: assembled path handles adaptive/legacy/env false/custom directly", () => {
-  const adaptiveInput = {
+check("production adapter: exact Opus 4.6 and Opus 5 policies work directly", () => {
+  const tools = [{
+    type: "function",
+    function: {
+      name: "fixture_tool",
+      description: "fixture",
+      parameters: { type: "object", properties: {} },
+    },
+  }];
+  const forcedTool = { type: "function", function: { name: "fixture_tool" } };
+  const opus5Input = {
     model: "companion",
     messages: [],
-    max_tokens: 512,
-    extra_body: {
-      thinking: { type: "adaptive" },
-      output_config: { effort: "max" },
-    },
+    max_tokens: 1,
+    temperature: 0.7,
+    reasoning_effort: "xhigh",
+    tools,
+    tool_choice: forcedTool,
   };
-  const adaptive = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
-    adaptiveInput,
-    "anthropic/claude-sonnet-4-6",
+  const opus5 = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+    opus5Input,
+    "custom-bedrock/claude-opus-5-20260725",
     makeProductionAssembledFixture(),
     {}
   );
-  assert.deepStrictEqual(adaptive.thinking, { type: "adaptive" });
-  assert.deepStrictEqual(adaptive.output_config, { effort: "max" });
-  assert.strictEqual(adaptive.max_tokens, 512);
+  assert.deepStrictEqual(opus5.thinking, { type: "adaptive", display: "summarized" });
+  assert.deepStrictEqual(opus5.output_config, { effort: "xhigh" });
+  assert.strictEqual(opus5.max_tokens, 1);
+  assert.strictEqual(opus5.temperature, undefined);
+  assert.deepStrictEqual(opus5.tool_choice, { type: "tool", name: "fixture_tool" });
+  assert.strictEqual(opus5.model, "claude-opus-5-20260725");
 
-  const legacy = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+  const legacy46 = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
     {
       model: "companion",
       messages: [],
+      max_tokens: 1,
+      temperature: 0.7,
+      tools,
+      tool_choice: forcedTool,
       extraBody: {
         thinking: { type: "adaptive" },
         output_config: { effort: "high" },
       },
     },
-    "anthropic/claude-sonnet-4-5",
+    "custom-bedrock/claude-opus-4-6",
     makeProductionAssembledFixture(),
     {}
   );
-  assert.deepStrictEqual(legacy.thinking, {
+  assert.deepStrictEqual(legacy46.thinking, {
     type: "enabled",
     budget_tokens: 4096,
     display: "summarized",
   });
-  assert.strictEqual(legacy.output_config, undefined);
+  assert.strictEqual(legacy46.output_config, undefined);
+  assert.ok(legacy46.max_tokens > legacy46.thinking.budget_tokens);
+  assert.strictEqual(legacy46.temperature, undefined);
+  assert.deepStrictEqual(legacy46.tool_choice, { type: "auto" });
+  assert.strictEqual(legacy46.model, "claude-opus-4-6");
 
-  const disabled = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
-    adaptiveInput,
-    "custom-bedrock/claude-opus-4-6-20260701",
-    makeProductionAssembledFixture(),
-    { ANTHROPIC_THINKING_ENABLED: "false" }
-  );
-  assert.strictEqual(disabled.model, "claude-opus-4-6-20260701");
-  assert.strictEqual(disabled.thinking, undefined);
-  assert.strictEqual(disabled.output_config, undefined);
-
-  const custom = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
-    adaptiveInput,
-    "custom-bedrock/claude-opus-4-6-20260701",
-    makeProductionAssembledFixture(),
-    {}
-  );
-  assert.deepStrictEqual(custom.thinking, { type: "adaptive" });
-  assert.deepStrictEqual(custom.output_config, { effort: "max" });
-
-  const invalidOutputEffort = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+  const legacy46Xhigh = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
     {
       model: "companion",
       messages: [],
-      extra_body: {
-        thinking: { type: "adaptive" },
-        output_config: { effort: "xhigh" },
-      },
+      max_tokens: 1,
+      reasoning_effort: "xhigh",
     },
-    "anthropic/claude-sonnet-4-6",
+    "anthropic/claude-opus-4-6",
     makeProductionAssembledFixture(),
     {}
   );
-  assert.deepStrictEqual(
-    invalidOutputEffort.output_config,
-    { effort: "low" },
-    "output_config accepts only native low/medium/high/max values"
+  assert.deepStrictEqual(legacy46Xhigh.thinking, {
+    type: "enabled",
+    budget_tokens: 8192,
+    display: "summarized",
+  });
+  assert.strictEqual(legacy46Xhigh.output_config, undefined);
+  assert.strictEqual(legacy46Xhigh.max_tokens, 8448);
+
+  const defaultOn = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+    { model: "companion", messages: [], max_tokens: 1, temperature: 0.7, tools, tool_choice: "required" },
+    "anthropic/claude-opus-5",
+    makeProductionAssembledFixture(),
+    {}
   );
+  assert.deepStrictEqual(defaultOn.thinking, { type: "adaptive", display: "summarized" });
+  assert.strictEqual(defaultOn.output_config, undefined);
+  assert.strictEqual(defaultOn.max_tokens, 1);
+  assert.strictEqual(defaultOn.temperature, undefined);
+  assert.deepStrictEqual(defaultOn.tool_choice, { type: "any" });
+
+  const disabled = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+    { ...opus5Input, reasoning_effort: undefined, thinking: false },
+    "anthropic/claude-opus-5",
+    makeProductionAssembledFixture(),
+    {}
+  );
+  assert.deepStrictEqual(disabled.thinking, { type: "disabled" });
+  assert.strictEqual(disabled.output_config, undefined);
+  assert.strictEqual(disabled.max_tokens, 1);
+  assert.strictEqual(disabled.temperature, undefined);
+  assert.deepStrictEqual(disabled.tool_choice, { type: "tool", name: "fixture_tool" });
+
+  const envDisabled = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+    opus5Input,
+    "anthropic/claude-opus-5",
+    makeProductionAssembledFixture(),
+    { ANTHROPIC_THINKING_ENABLED: "false" }
+  );
+  assert.deepStrictEqual(envDisabled.thinking, { type: "disabled" });
+  assert.strictEqual(envDisabled.output_config, undefined);
+
+  const protocolShape = (request) => ({
+    cache_control: request.cache_control,
+    tools: request.tools,
+    system: request.system,
+    messages: request.messages.map((message) => ({
+      role: message.role,
+      content: message.content.map((block) => ({
+        type: block.type,
+        text: block.text?.startsWith("以下是网关提供的当前时间") ? "<time>" : block.text,
+        cache_control: block.cache_control,
+      })),
+    })),
+  });
+  assert.deepStrictEqual(
+    protocolShape(disabled),
+    protocolShape(opus5),
+    "thinking policy must not alter cache/injection/message/tools/system structure"
+  );
+  assert.ok(opus5.messages.some((message) =>
+    message.content.some((block) => block.text === "<memories>dynamic</memories>")
+  ));
 });
 
-await checkAsync("production adapter: native path keeps output_config consistent with signed-thinking guard", async () => {
+await checkAsync("production adapter: native signed-thinking guard is legacy-safe and Opus 5 best-effort", async () => {
   const originalFetch = globalThis.fetch;
   let fetchCalls = 0;
+  let stashLookups = 0;
   globalThis.fetch = async () => {
     fetchCalls += 1;
     return new Response(JSON.stringify([]), {
@@ -2410,6 +2568,7 @@ await checkAsync("production adapter: native path keeps output_config consistent
         bind() {
           return {
             async first() {
+              stashLookups += 1;
               return null;
             },
           };
@@ -2439,14 +2598,34 @@ await checkAsync("production adapter: native path keeps output_config consistent
   };
 
   try {
-    const guarded = await productionAnthropicAdapter.buildAnthropicNativeRequest(baseRequest, {
+    const guardedLegacy = await productionAnthropicAdapter.buildAnthropicNativeRequest(baseRequest, {
       env: { DB: missDb, SWEEPY_URL: "https://memory.invalid" },
-      targetModel: "anthropic/claude-sonnet-4-6",
+      targetModel: "anthropic/claude-opus-4-6",
       namespace: "test",
       memories: [],
     });
-    assert.strictEqual(guarded.thinking, undefined);
-    assert.strictEqual(guarded.output_config, undefined);
+    assert.strictEqual(guardedLegacy.thinking, undefined);
+    assert.strictEqual(guardedLegacy.output_config, undefined);
+
+    const opus5Explicit = await productionAnthropicAdapter.buildAnthropicNativeRequest(baseRequest, {
+      env: { DB: missDb, SWEEPY_URL: "https://memory.invalid" },
+      targetModel: "anthropic/claude-opus-5",
+      namespace: "test",
+      memories: [],
+    });
+    assert.deepStrictEqual(opus5Explicit.thinking, { type: "adaptive", display: "summarized" });
+    assert.deepStrictEqual(opus5Explicit.output_config, { effort: "high" });
+
+    const defaultRequest = structuredClone(baseRequest);
+    delete defaultRequest.extra_body;
+    const opus5Default = await productionAnthropicAdapter.buildAnthropicNativeRequest(defaultRequest, {
+      env: { DB: missDb, SWEEPY_URL: "https://memory.invalid" },
+      targetModel: "anthropic/claude-opus-5",
+      namespace: "test",
+      memories: [],
+    });
+    assert.deepStrictEqual(opus5Default.thinking, { type: "adaptive", display: "summarized" });
+    assert.strictEqual(opus5Default.output_config, undefined);
 
     const signedRequest = structuredClone(baseRequest);
     signedRequest.messages[1].thinking_blocks = [{
@@ -2454,27 +2633,30 @@ await checkAsync("production adapter: native path keeps output_config consistent
       thinking: "signed",
       signature: "sig_fixture",
     }];
-    const signed = await productionAnthropicAdapter.buildAnthropicNativeRequest(signedRequest, {
+    const signedLegacy = await productionAnthropicAdapter.buildAnthropicNativeRequest(signedRequest, {
       env: { DB: missDb, SWEEPY_URL: "https://memory.invalid" },
-      targetModel: "anthropic/claude-sonnet-4-6",
+      targetModel: "anthropic/claude-opus-4-6",
       namespace: "test",
       memories: [],
     });
-    assert.deepStrictEqual(signed.thinking, { type: "adaptive" });
-    assert.deepStrictEqual(signed.output_config, { effort: "high" });
-    assert.strictEqual(fetchCalls, 2, "native test fetch stub should service only the two memory reads");
+    assert.deepStrictEqual(signedLegacy.thinking, {
+      type: "enabled",
+      budget_tokens: 4096,
+      display: "summarized",
+    });
+    assert.strictEqual(signedLegacy.output_config, undefined);
+    assert.strictEqual(stashLookups, 3, "legacy miss and both Opus 5 modes must check the stash");
+    assert.strictEqual(fetchCalls, 4, "native test fetch stub should service only the four memory reads");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-check("production heartbeat: real makeReplayable handles adaptive and legacy", () => {
+check("production heartbeat: real replay handles Opus 5 modes and Opus 4.6 budget", () => {
   const base = {
-    model: "claude-sonnet-4-6",
+    model: "claude-opus-5",
     max_tokens: 4096,
     stream: true,
-    thinking: { type: "adaptive" },
-    output_config: { effort: "max" },
     system: [],
     messages: [{
       role: "user",
@@ -2484,16 +2666,23 @@ check("production heartbeat: real makeReplayable handles adaptive and legacy", (
       ],
     }],
   };
-  const adaptive = productionHeartbeatPrefix.makeReplayable(base);
-  assert.strictEqual(adaptive.max_tokens, 1);
-  assert.ok(Number.isFinite(adaptive.max_tokens));
-  assert.deepStrictEqual(adaptive.output_config, { effort: "max" });
-  assert.ok(!adaptive.messages[0].content.some((block) => block.text === "volatile"));
-  assert.deepStrictEqual(adaptive.messages[0].content[0].cache_control, { type: "ephemeral" });
+  for (const protocol of [
+    { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "xhigh" } },
+    { thinking: { type: "adaptive", display: "summarized" } },
+    { thinking: { type: "disabled" } },
+  ]) {
+    const replay = productionHeartbeatPrefix.makeReplayable({ ...base, ...protocol });
+    assert.strictEqual(replay.max_tokens, 1);
+    assert.ok(Number.isFinite(replay.max_tokens));
+    assert.deepStrictEqual(replay.thinking, protocol.thinking);
+    assert.deepStrictEqual(replay.output_config, protocol.output_config);
+    assert.ok(!replay.messages[0].content.some((block) => block.text === "volatile"));
+    assert.deepStrictEqual(replay.messages[0].content[0].cache_control, { type: "ephemeral" });
+  }
 
   const legacy = productionHeartbeatPrefix.makeReplayable({
     ...base,
-    model: "claude-sonnet-4-5",
+    model: "claude-opus-4-6",
     thinking: { type: "enabled", budget_tokens: 2048, display: "summarized" },
     output_config: undefined,
   });

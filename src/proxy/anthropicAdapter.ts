@@ -77,9 +77,12 @@ export interface AnthropicRequest {
     display?: "summarized" | "omitted";
   } | {
     type: "adaptive";
+    display?: "summarized" | "omitted";
+  } | {
+    type: "disabled";
   };
   output_config?: {
-    effort: "low" | "medium" | "high" | "max";
+    effort: "low" | "medium" | "high" | "xhigh" | "max";
   };
   tools?: AnthropicTool[];
   tool_choice?: AnthropicToolChoice;
@@ -213,8 +216,8 @@ export function convertOpenAITools(req: OpenAIChatRequest): AnthropicTool[] | un
 
 /**
  * OpenAI tool_choice → Anthropic tool_choice。
- * 注意：extended thinking 开启时 Anthropic 仅接受 auto/none，
- * any/tool 会被上游 400，故传入 thinking 以便降级。
+ * 对仍受 extended-thinking 限制的模型，any/tool 会被上游 400，
+ * 故传入 thinkingEnabled 以便降级；Opus 5 调用方会保留 forced tool choice。
  */
 export function convertOpenAIToolChoice(
   req: OpenAIChatRequest,
@@ -284,15 +287,21 @@ function stripAnthropicModelPrefix(model: string): string {
   return parseCustomProviderModel(model)?.model || stripAnthropicProviderPrefix(model);
 }
 
-/**
- * Adaptive thinking is an explicit model capability, not a provider-wide
- * default. Normalize gateway/provider prefixes first, then match only the
- * known Claude 4.6 families so older models retain the enabled+budget wire
- * format.
- */
+function getCanonicalAnthropicModel(model: string): string {
+  return stripAnthropicModelPrefix(model).trim().toLowerCase();
+}
+
+function isCanonicalOpus46(model: string): boolean {
+  return getCanonicalAnthropicModel(model) === "claude-opus-4-6";
+}
+
+function isOpus5(model: string): boolean {
+  return /^claude-opus-5(?:$|-[a-z0-9]+(?:-[a-z0-9]+)*)$/.test(getCanonicalAnthropicModel(model));
+}
+
 function supportsAdaptiveThinking(model: string): boolean {
-  const canonical = stripAnthropicModelPrefix(model).trim().toLowerCase();
-  return /^claude-(?:opus|sonnet)-4-6(?:$|-)/.test(canonical);
+  const canonical = getCanonicalAnthropicModel(model);
+  return /^claude-(?:opus|sonnet)-4-6(?:$|-)/.test(canonical) && !isCanonicalOpus46(model);
 }
 
 function getCustomAnthropicMessagesPath(env: Env): string {
@@ -425,14 +434,15 @@ function normalizeThinkingEffort(value: unknown): ThinkingEffort | null {
   if (["minimal", "low"].includes(normalized)) return "low";
   if (["medium", "auto"].includes(normalized)) return "medium";
   if (normalized === "high") return "high";
-  if (["max", "xhigh", "extra_high"].includes(normalized)) return "max";
+  if (["xhigh", "extra_high"].includes(normalized)) return "xhigh";
+  if (normalized === "max") return "max";
   return null;
 }
 
 function normalizeOutputConfigEffort(value: unknown): ThinkingEffort | null {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
-  return ["low", "medium", "high", "max"].includes(normalized)
+  return ["low", "medium", "high", "xhigh", "max"].includes(normalized)
     ? normalized as ThinkingEffort
     : null;
 }
@@ -549,8 +559,30 @@ function buildThinkingConfig(
   req: OpenAIChatRequest,
   targetModel: string
 ): ThinkingConfig {
-  if (env.ANTHROPIC_THINKING_ENABLED === "false") return {};
   const requestDirective = getRequestThinkingDirective(req);
+  if (isOpus5(targetModel)) {
+    if (env.ANTHROPIC_THINKING_ENABLED === "false" || requestDirective.enabled === false) {
+      return { thinking: { type: "disabled" } };
+    }
+
+    const explicitlyEnabled =
+      requestDirective.enabled === true ||
+      requestDirective.budget !== undefined ||
+      env.ANTHROPIC_THINKING_ENABLED === "true";
+    if (!explicitlyEnabled) {
+      return { thinking: { type: "adaptive", display: "summarized" } };
+    }
+
+    const budget = requestDirective.budget ?? getEnvThinkingBudget(env);
+    return {
+      thinking: { type: "adaptive", display: "summarized" },
+      outputConfig: {
+        effort: requestDirective.effort ?? effortFromThinkingBudget(budget)
+      }
+    };
+  }
+
+  if (env.ANTHROPIC_THINKING_ENABLED === "false") return {};
   if (requestDirective.enabled === false) return {};
 
   let budget: number | undefined;
@@ -587,7 +619,7 @@ function getAnthropicMaxTokens(
 ): number {
   const maxTokens = getMaxTokens(req);
   if (!thinking) return maxTokens;
-  if (thinking.type === "adaptive") return maxTokens;
+  if (thinking.type !== "enabled") return maxTokens;
   return Math.max(maxTokens, thinking.budget_tokens + Math.min(Math.max(maxTokens, 256), 4096));
 }
 
@@ -669,7 +701,9 @@ export function convertMessages(messages: OpenAIChatMessage[]): AnthropicMessage
  * 消息含 tool_use 却没有可回放的带签名 thinking 块，上游会以 400（signature 缺失）
  * 拒绝。客户端未回传 thinking_blocks 时，先尝试从 D1 暂存按 tool_use id 回填
  *（见 thinkingStash.ts）；回填成功则 thinking 保持开启——避免 thinking 参数
- * 逐轮开关横跳打掉 messages 级缓存断点。仅在暂存也未命中时才关闭 thinking 保通路。
+ * 逐轮开关横跳打掉 messages 级缓存断点。legacy thinking 在暂存也未命中时
+ * 关闭保通路；Opus 5 可优雅处理缺失历史 thinking，因此调用方只做 best-effort
+ * 回填，miss 时仍保持 default/adaptive。
  *
  * 返回 true 表示 thinking 可保持开启（无需回填或回填成功），false 表示须关闭。
  */
@@ -782,7 +816,12 @@ export async function buildAnthropicNativeRequest(
   const messages = convertMessages(req.messages);
   const thinkingConfig = buildThinkingConfig(input.env, req, input.targetModel);
   let thinking = thinkingConfig.thinking;
-  if (thinking && !(await restoreSignedThinkingForToolHistory(input.env.DB, input.namespace, messages))) {
+  if (
+    thinking &&
+    thinking.type !== "disabled" &&
+    !(await restoreSignedThinkingForToolHistory(input.env.DB, input.namespace, messages)) &&
+    !isOpus5(input.targetModel)
+  ) {
     thinking = undefined;
   }
   applyRollingMessageCache(messages, input.env);
@@ -795,12 +834,17 @@ export async function buildAnthropicNativeRequest(
     model: stripAnthropicModelPrefix(input.targetModel),
     max_tokens: getAnthropicMaxTokens(req, input.env, thinking),
     cache_control: buildAutomaticCacheControl(input.env),
-    temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
+    temperature: isOpus5(input.targetModel) || (thinking && thinking.type !== "disabled")
+      ? undefined
+      : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
     thinking,
     output_config: thinking?.type === "adaptive" ? thinkingConfig.outputConfig : undefined,
     tools: convertOpenAITools(req),
-    tool_choice: convertOpenAIToolChoice(req, Boolean(thinking)),
+    tool_choice: convertOpenAIToolChoice(
+      req,
+      Boolean(thinking && thinking.type !== "disabled" && !isOpus5(input.targetModel))
+    ),
     system,
     messages
   };
@@ -841,12 +885,17 @@ export function buildAnthropicRequestFromAssembled(
     model: stripAnthropicModelPrefix(targetModel),
     max_tokens: getAnthropicMaxTokens(req, env, thinking),
     cache_control: buildAutomaticCacheControl(env),
-    temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
+    temperature: isOpus5(targetModel) || (thinking && thinking.type !== "disabled")
+      ? undefined
+      : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
     thinking,
     output_config: thinkingConfig.outputConfig,
     tools: convertOpenAITools(req),
-    tool_choice: convertOpenAIToolChoice(req, Boolean(thinking)),
+    tool_choice: convertOpenAIToolChoice(
+      req,
+      Boolean(thinking && thinking.type !== "disabled" && !isOpus5(targetModel))
+    ),
     system,
     messages,
   };
