@@ -322,7 +322,7 @@ Model:      companion
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `CHAT_MODEL` | `deepseek/deepseek-v4-pro` | 主聊天 |
-| `MEMORY_FILTER_MODEL` | `workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 串行执行记忆筛选和压缩，默认走 Workers AI；也兼容把 JSON 放进 reasoning_content 的模型 |
+| `MEMORY_FILTER_MODEL` | `deepseek/deepseek-v4-flash-0731` | 串行执行记忆筛选和压缩，经 OpenRouter 调用并关闭 reasoning/thinking |
 | `MEMORY_FILTER_MAX_CANDIDATES` | `12` | 进入小秘书的候选记忆上限 |
 | `MEMORY_FILTER_MAX_OUTPUT` | `4` | 正常筛选成功时最多注入 4 条；筛选失败时压缩兜底最多注入 10 条 |
 | `MEMORY_FILTER_OUTPUT_CHARS` | `300` | 压缩结果每条内容的硬截断字符数 |

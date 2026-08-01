@@ -21,8 +21,8 @@ SUMMARY_MODEL = "deepseek/deepseek-v4-flash:free"
 # 视觉模型
 VISION_MODEL = "minimax/minimax-m3"
 
-# ─── 记忆过滤（仍走 Workers AI，免费）───
-MEMORY_FILTER_MODEL = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+# ─── 记忆筛选与压缩（走 OpenRouter，便于查看调用日志）───
+MEMORY_FILTER_MODEL = "deepseek/deepseek-v4-flash-0731"
 MEMORY_FILTER_MAX_CANDIDATES = "12"
 MEMORY_FILTER_MAX_OUTPUT = "4"
 MEMORY_FILTER_MAX_CONTENT_CHARS = "700"
