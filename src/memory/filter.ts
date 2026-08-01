@@ -2,11 +2,15 @@ import { callOpenAICompat } from "../proxy/openaiAdapter";
 import type { Env, MemoryApiRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 
 const DEFAULT_WORKERS_AI_FILTER_MODEL = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const FILTER_SUCCESS_LIMIT = 4;
+const FILTER_FAILURE_COMPRESSION_LIMIT = 10;
 
 interface FilteredMemoryItem {
   id: string;
-  content: string;
+  content?: string;
 }
+
+type MemoryFilterStageStatus = "success" | "error" | "skipped";
 
 export interface MemoryFilterMeta {
   status: "disabled" | "success" | "error" | "empty";
@@ -17,9 +21,36 @@ export interface MemoryFilterMeta {
   output_count: number;
   reason?: string;
   output_shape?: string;
+  filter_status: MemoryFilterStageStatus;
+  filter_input_count: number;
+  filter_output_count: number;
+  filter_reason?: string;
+  compression_status: MemoryFilterStageStatus;
+  compression_input_count: number;
+  compression_output_count: number;
+  compression_reason?: string;
 }
 
 const FILTER_RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    memories: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" }
+        },
+        required: ["id"],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ["memories"],
+  additionalProperties: false
+};
+
+const COMPRESSION_RESPONSE_SCHEMA = {
   type: "object",
   properties: {
     memories: {
@@ -92,8 +123,8 @@ function getMaxCandidates(env: Env): number {
 }
 
 function getMaxOutput(env: Env): number {
-  const value = Number(env.MEMORY_FILTER_MAX_OUTPUT || 6);
-  return Number.isFinite(value) ? clamp(Math.floor(value), 1, 20) : 6;
+  const value = Number(env.MEMORY_FILTER_MAX_OUTPUT || FILTER_SUCCESS_LIMIT);
+  return Number.isFinite(value) ? clamp(Math.floor(value), 1, FILTER_SUCCESS_LIMIT) : FILTER_SUCCESS_LIMIT;
 }
 
 function getMaxContentChars(env: Env): number {
@@ -118,6 +149,11 @@ function getFilterMinScore(env: Env): number {
 
 function truncateText(text: string, maxChars: number): string {
   return text.length > maxChars ? `${text.slice(0, maxChars).trim()}...` : text;
+}
+
+function hardTruncateText(text: string, maxChars: number): string {
+  const codePoints = Array.from(text);
+  return codePoints.length > maxChars ? codePoints.slice(0, maxChars).join("").trim() : text;
 }
 
 function normalizeForDedupe(text: string): string {
@@ -220,37 +256,64 @@ function extractJsonArray(value: unknown): unknown[] | null {
   return null;
 }
 
-function parseFilteredItems(value: unknown): FilteredMemoryItem[] | null {
+interface ParsedMemoryItems {
+  items: FilteredMemoryItem[];
+  invalidNonEmpty: boolean;
+}
+
+function parseMemoryItems(
+  value: unknown,
+  requireContent: boolean,
+  allowedIds: Set<string>,
+  maxOutputChars: number
+): ParsedMemoryItems | null {
   const array = extractJsonArray(value);
   if (!array) return null;
 
   const items: FilteredMemoryItem[] = [];
+  const seenIds = new Set<string>();
+  const seenContent = new Set<string>();
+
   for (const item of array) {
     if (!item || typeof item !== "object") continue;
     const record = item as { id?: unknown; content?: unknown; compressed_content?: unknown };
-    const id = typeof record.id === "string" ? record.id : null;
-    const content =
+    const id = typeof record.id === "string" ? record.id.trim() : "";
+    if (!id || !allowedIds.has(id) || seenIds.has(id)) continue;
+
+    if (!requireContent) {
+      seenIds.add(id);
+      items.push({ id });
+      continue;
+    }
+
+    const rawContent =
       typeof record.content === "string"
         ? record.content
         : typeof record.compressed_content === "string"
           ? record.compressed_content
           : null;
+    if (!rawContent) continue;
 
-    if (id && content) {
-      const sanitized = sanitizeMemoryContent(content);
-      if (sanitized) items.push({ id, content: sanitized });
-    }
+    const content = hardTruncateText(sanitizeMemoryContent(rawContent), maxOutputChars);
+    const normalized = normalizeForDedupe(content);
+    if (!content || !normalized || seenContent.has(normalized)) continue;
+
+    seenIds.add(id);
+    seenContent.add(normalized);
+    items.push({ id, content });
   }
 
-  return items;
+  return {
+    items,
+    invalidNonEmpty: array.length > 0 && items.length === 0
+  };
 }
 
-function buildPrompt(input: {
+function buildFilterPrompt(input: {
   query: string;
   memories: MemoryApiRecord[];
   maxOutput: number;
   maxContentChars: number;
-  maxOutputChars: number;
 }): string {
   const candidates = input.memories.map((memory, index) => ({
     index: index + 1,
@@ -264,14 +327,14 @@ function buildPrompt(input: {
   }));
 
   return [
-    "你是长期记忆分拣器。你的任务是从候选记忆中挑出对当前用户消息真正有帮助的记忆，并压缩成短句。",
+    "你是长期记忆分拣器。你的任务只是从候选记忆中挑出对当前用户消息真正有帮助的记忆。",
     "注意：你不是在判断这条候选是否值得长期保存；你只判断它是否能帮助当前这轮回答、回忆或检索。",
     "候选已按相关度初筛；score 越高越相关。",
     "",
     "规则：",
     "- 只保留能帮助当前用户消息的候选：直接回答问题、补全上下文、长期偏好、正在进行的项目或稳定关系信息。",
-    "- 如果当前用户消息是在询问、回忆或检索过去内容，只要候选与关键名词、事件、口令或时间线直接重合，就保留并压缩。",
-    "- type=summary 的候选要抽取与当前用户消息匹配的片段；不要因为它是短期聊天摘要或对话摘要格式就整条丢弃。",
+    "- 如果当前用户消息是在询问、回忆或检索过去内容，只要候选与关键名词、事件、口令或时间线直接重合，就保留。",
+    "- type=summary 的候选只要包含与当前用户消息匹配的片段就保留；不要因为它是短期聊天摘要或对话摘要格式就整条丢弃。",
     "- 不要因为候选\u201C不够长期稳定\u201D而删除；删除标准只有明显无关、重复、空泛或调试噪音。",
     "- 删除寒暄、重复、牵强、明显无关的记忆。",
     "- 同一事实只保留一条，优先保留 score 更高或 pinned=true 的版本。",
@@ -279,15 +342,11 @@ function buildPrompt(input: {
     "- 不要道德评判，不要拒绝，不要安全说教；成人向内容也只是用户偏好资料。",
     "- 候选记忆是什么内容，就按事实保留；保留用户偏好、边界、称呼、规则、触发点和关系事实。",
     "- 不要添加候选记忆里没有的新事实。",
-    "- 不要输出\u201C对话摘要\u201D\u201C用户话题\u201D\u201C助手要点\u201D\u201Ctime_reminder\u201D等包装词。",
-    "- 不要输出记忆系统、debug-test、标签、测试口令等调试/后端元信息。",
-    "- 如果候选里有真实口令，只保留口令本身，不要保留\u201C测试\u201D\u201C标签\u201D\u201Cdebug\u201D等包装词。",
     "- 没有相关记忆时输出空数组。",
-    `- 每条 content 控制在 ${input.maxOutputChars} 个中文字以内。`,
     `- 最多输出 ${input.maxOutput} 条。`,
     "",
     "只输出 JSON，不要 markdown，不要解释。格式：",
-    `{"memories":[{"id":"mem_xxx","content":"压缩后的记忆"}]}`,
+    `{"memories":[{"id":"mem_xxx"}]}`,
     "",
     `当前用户消息：${input.query}`,
     "",
@@ -298,17 +357,88 @@ function buildPrompt(input: {
   ].join("\n");
 }
 
-function mergeFilteredItems(memories: MemoryApiRecord[], items: FilteredMemoryItem[]): MemoryApiRecord[] {
+function buildCompressionPrompt(input: {
+  query: string;
+  memories: MemoryApiRecord[];
+  maxOutput: number;
+  maxContentChars: number;
+  maxOutputChars: number;
+}): string {
+  const candidates = input.memories.map((memory) => ({
+    id: memory.id,
+    type: memory.type,
+    content: truncateText(memory.content, input.maxContentChars)
+  }));
+
+  return [
+    "你是长期记忆压缩器。把输入记忆压缩成适合当前回答使用的简短事实。",
+    "",
+    "规则：",
+    "- 只能使用输入中存在的 id 和事实，不得创造新 id 或新事实。",
+    "- 保留与当前用户消息有关的偏好、边界、称呼、规则、触发点、关系事实、事件和真实口令。",
+    "- type=summary 时只提取与当前用户消息有关的片段。",
+    "- 删除寒暄、重复、空泛内容和调试/后端元信息。",
+    "- 不要输出\u201C对话摘要\u201D\u201C用户话题\u201D\u201C助手要点\u201D\u201Ctime_reminder\u201D\u201C记忆系统\u201D\u201Cdebug-test\u201D等包装词。",
+    "- 同一事实只保留一条。",
+    `- 每条 content 最多 ${input.maxOutputChars} 个字符。`,
+    `- 最多输出 ${input.maxOutput} 条。`,
+    "- 没有可用内容时输出空数组。",
+    "",
+    "只输出 JSON，不要 markdown，不要解释。格式：",
+    `{"memories":[{"id":"mem_xxx","content":"压缩后的记忆"}]}`,
+    "",
+    `当前用户消息：${input.query}`,
+    "",
+    `待压缩记忆：${JSON.stringify(candidates)}`
+  ].join("\n");
+}
+
+function selectKnownMemories(
+  memories: MemoryApiRecord[],
+  items: FilteredMemoryItem[],
+  limit: number
+): MemoryApiRecord[] {
   const byId = new Map(memories.map((memory) => [memory.id, memory]));
+  const seenIds = new Set<string>();
   const result: MemoryApiRecord[] = [];
 
   for (const item of items) {
     const memory = byId.get(item.id);
-    if (!memory) continue;
+    if (!memory || seenIds.has(item.id)) continue;
+    seenIds.add(item.id);
+    result.push(memory);
+    if (result.length >= limit) break;
+  }
+
+  return result;
+}
+
+function mergeCompressedItems(
+  memories: MemoryApiRecord[],
+  items: FilteredMemoryItem[],
+  limit: number,
+  maxOutputChars: number
+): MemoryApiRecord[] {
+  const byId = new Map(memories.map((memory) => [memory.id, memory]));
+  const seenIds = new Set<string>();
+  const seenContent = new Set<string>();
+  const result: MemoryApiRecord[] = [];
+
+  for (const item of items) {
+    const memory = byId.get(item.id);
+    if (!memory || !item.content || seenIds.has(item.id)) continue;
+
+    const content = hardTruncateText(sanitizeMemoryContent(item.content), maxOutputChars);
+    const normalized = normalizeForDedupe(content);
+    if (!content || !normalized || seenContent.has(normalized)) continue;
+
+    seenIds.add(item.id);
+    seenContent.add(normalized);
     result.push({
       ...memory,
-      content: item.content
+      content
     });
+    if (result.length >= limit) break;
   }
 
   return result;
@@ -330,7 +460,13 @@ function describeModelOutput(value: unknown): string {
   return "object";
 }
 
-async function callWorkersAiFilter(env: Env, prompt: string, model: string, maxTokens: number): Promise<unknown> {
+async function callWorkersAiStage(
+  env: Env,
+  prompt: string,
+  model: string,
+  maxTokens: number,
+  schema: typeof FILTER_RESPONSE_SCHEMA | typeof COMPRESSION_RESPONSE_SCHEMA
+): Promise<unknown> {
   if (!env.AI) return "";
 
   return env.AI.run(model, {
@@ -348,12 +484,12 @@ async function callWorkersAiFilter(env: Env, prompt: string, model: string, maxT
     max_tokens: maxTokens,
     response_format: {
       type: "json_schema",
-      json_schema: FILTER_RESPONSE_SCHEMA
+      json_schema: schema
     }
   });
 }
 
-async function callOpenAICompatFilter(env: Env, prompt: string, model: string, maxTokens: number): Promise<string> {
+async function callOpenAICompatStage(env: Env, prompt: string, model: string, maxTokens: number): Promise<string> {
   const request: OpenAIChatRequest = {
     model,
     messages: [
@@ -371,6 +507,7 @@ async function callOpenAICompatFilter(env: Env, prompt: string, model: string, m
     response_format: {
       type: "json_object"
     },
+    reasoning: { enabled: false },
     enable_thinking: false,
     stream: false
   };
@@ -383,6 +520,82 @@ async function callOpenAICompatFilter(env: Env, prompt: string, model: string, m
   const content = typeof message?.content === "string" ? message.content.trim() : "";
   const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
   return content || reasoning;
+}
+
+interface MemoryStageResult {
+  status: "success" | "error";
+  items: FilteredMemoryItem[];
+  reason?: string;
+  outputShape?: string;
+}
+
+async function runMemoryStage(
+  env: Env,
+  input: {
+    prompt: string;
+    requireContent: boolean;
+    allowedIds: Set<string>;
+    maxOutputChars: number;
+    schema: typeof FILTER_RESPONSE_SCHEMA | typeof COMPRESSION_RESPONSE_SCHEMA;
+  }
+): Promise<MemoryStageResult> {
+  const provider = getProvider(env);
+  const model = getModel(env);
+
+  try {
+    const output =
+      provider === "openai-compatible"
+        ? await callOpenAICompatStage(env, input.prompt, model, getMaxTokens(env))
+        : await callWorkersAiStage(
+            env,
+            input.prompt,
+            getWorkersAiModel(env) || model,
+            getMaxTokens(env),
+            input.schema
+          );
+    const outputShape = describeModelOutput(output);
+    if (!output) {
+      return { status: "error", items: [], reason: "empty_model_output", outputShape };
+    }
+
+    const parsed = parseMemoryItems(
+      output,
+      input.requireContent,
+      input.allowedIds,
+      input.maxOutputChars
+    );
+    if (!parsed) {
+      return { status: "error", items: [], reason: "invalid_model_output", outputShape };
+    }
+    if (parsed.invalidNonEmpty) {
+      return { status: "error", items: [], reason: "no_valid_model_items", outputShape };
+    }
+
+    return { status: "success", items: parsed.items, outputShape };
+  } catch {
+    return { status: "error", items: [], reason: "model_error" };
+  }
+}
+
+function logMemoryFilterStages(meta: MemoryFilterMeta): void {
+  console.info(JSON.stringify({
+    event: "memory_filter_stages",
+    model: meta.model,
+    provider: meta.provider,
+    filter: {
+      status: meta.filter_status,
+      input_count: meta.filter_input_count,
+      output_count: meta.filter_output_count,
+      reason: meta.filter_reason || (meta.filter_status === "success" ? "ok" : "not_applicable")
+    },
+    compression: {
+      status: meta.compression_status,
+      input_count: meta.compression_input_count,
+      output_count: meta.compression_output_count,
+      reason: meta.compression_reason || (meta.compression_status === "success" ? "ok" : "not_applicable")
+    },
+    ...(meta.reason ? { reason: meta.reason } : {})
+  }));
 }
 
 export async function filterAndCompressMemories(
@@ -400,103 +613,144 @@ export async function filterAndCompressMemoriesWithMeta(
   const query = input.query.trim();
   const provider = getProvider(env);
   const model = getModel(env);
-  const baseMeta = {
+  const baseMeta: MemoryFilterMeta = {
+    status: "disabled",
     provider,
     model,
     raw_count: input.memories.length,
     candidate_count: 0,
-    output_count: input.memories.length
+    output_count: input.memories.length,
+    filter_status: "skipped",
+    filter_input_count: 0,
+    filter_output_count: 0,
+    compression_status: "skipped",
+    compression_input_count: 0,
+    compression_output_count: 0
   };
 
   if (!isEnabled(env) || !query) {
-    return {
-      data: input.memories,
-      meta: {
-        ...baseMeta,
-        status: "disabled",
-        reason: !query ? "empty_query" : "filter_disabled"
-      }
+    const meta: MemoryFilterMeta = {
+      ...baseMeta,
+      reason: !query ? "empty_query" : "filter_disabled",
+      filter_reason: !query ? "empty_query" : "filter_disabled",
+      compression_reason: "filter_not_run"
     };
+    logMemoryFilterStages(meta);
+    return { data: input.memories, meta };
   }
 
   const maxOutput = getMaxOutput(env);
+  const maxContentChars = getMaxContentChars(env);
+  const maxOutputChars = getMaxOutputChars(env);
   const candidates = prepareCandidates(env, input.memories);
   if (candidates.length === 0) {
-    return {
-      data: [],
-      meta: {
-        ...baseMeta,
-        status: "empty",
-        candidate_count: 0,
-        output_count: 0,
-        reason: "no_candidates"
-      }
+    const meta: MemoryFilterMeta = {
+      ...baseMeta,
+      status: "empty",
+      output_count: 0,
+      reason: "no_candidates",
+      filter_reason: "no_candidates",
+      compression_reason: "no_candidates"
     };
+    logMemoryFilterStages(meta);
+    return { data: [], meta };
   }
 
-  const activeMeta = {
-    ...baseMeta,
-    candidate_count: candidates.length,
-    output_count: 0
-  };
-  const prompt = buildPrompt({
-    query,
-    memories: candidates,
-    maxOutput,
-    maxContentChars: getMaxContentChars(env),
-    maxOutputChars: getMaxOutputChars(env)
+  const filterResult = await runMemoryStage(env, {
+    prompt: buildFilterPrompt({
+      query,
+      memories: candidates,
+      maxOutput,
+      maxContentChars
+    }),
+    requireContent: false,
+    allowedIds: new Set(candidates.map((memory) => memory.id)),
+    maxOutputChars,
+    schema: FILTER_RESPONSE_SCHEMA
   });
-  const maxTokens = getMaxTokens(env);
 
-  try {
-    const output =
-      provider === "openai-compatible"
-        ? await callOpenAICompatFilter(env, prompt, model, maxTokens)
-        : await callWorkersAiFilter(env, prompt, getWorkersAiModel(env) || model, maxTokens);
-    if (!output) {
-      return {
-        data: candidates,
-        meta: {
-          ...activeMeta,
-          status: "error",
-          reason: "empty_model_output",
-          output_shape: describeModelOutput(output)
-        }
-      };
-    }
+  const filterSucceeded = filterResult.status === "success";
+  const filtered = filterSucceeded
+    ? selectKnownMemories(candidates, filterResult.items, maxOutput)
+    : [];
+  const compressionInput = filterSucceeded ? filtered : candidates;
+  const compressionLimit = filterSucceeded ? maxOutput : FILTER_FAILURE_COMPRESSION_LIMIT;
 
-    const items = parseFilteredItems(output);
-    if (!items) {
-      return {
-        data: candidates,
-        meta: {
-          ...activeMeta,
-          status: "error",
-          reason: "invalid_model_output",
-          output_shape: describeModelOutput(output)
-        }
-      };
-    }
+  const compressionResult = await runMemoryStage(env, {
+    prompt: buildCompressionPrompt({
+      query,
+      memories: compressionInput,
+      maxOutput: compressionLimit,
+      maxContentChars,
+      maxOutputChars
+    }),
+    requireContent: true,
+    allowedIds: new Set(compressionInput.map((memory) => memory.id)),
+    maxOutputChars,
+    schema: COMPRESSION_RESPONSE_SCHEMA
+  });
 
-    const filtered = mergeFilteredItems(candidates, items).slice(0, maxOutput);
-    return {
-      data: filtered,
-      meta: {
-        ...activeMeta,
-        status: "success",
-        output_count: filtered.length,
-        output_shape: describeModelOutput(output)
-      }
+  if (compressionResult.status === "success") {
+    const compressed = mergeCompressedItems(
+      compressionInput,
+      compressionResult.items,
+      compressionLimit,
+      maxOutputChars
+    );
+    const meta: MemoryFilterMeta = {
+      ...baseMeta,
+      status: "success",
+      candidate_count: candidates.length,
+      output_count: compressed.length,
+      output_shape: compressionResult.outputShape,
+      filter_status: filterResult.status,
+      filter_input_count: candidates.length,
+      filter_output_count: filtered.length,
+      ...(filterResult.reason ? { filter_reason: filterResult.reason } : {}),
+      compression_status: "success",
+      compression_input_count: compressionInput.length,
+      compression_output_count: compressed.length
     };
-  } catch (error) {
-    console.error("memory filter failed", error);
-    return {
-      data: candidates,
-      meta: {
-        ...activeMeta,
-        status: "error",
-        reason: error instanceof Error && error.message ? error.message : "model_error"
-      }
-    };
+    logMemoryFilterStages(meta);
+    return { data: compressed, meta };
   }
+
+  if (filterSucceeded) {
+    const meta: MemoryFilterMeta = {
+      ...baseMeta,
+      status: "success",
+      candidate_count: candidates.length,
+      output_count: filtered.length,
+      reason: "compression_failed_using_filtered_originals",
+      output_shape: compressionResult.outputShape || filterResult.outputShape,
+      filter_status: "success",
+      filter_input_count: candidates.length,
+      filter_output_count: filtered.length,
+      compression_status: "error",
+      compression_input_count: compressionInput.length,
+      compression_output_count: 0,
+      compression_reason: compressionResult.reason
+    };
+    logMemoryFilterStages(meta);
+    return { data: filtered, meta };
+  }
+
+  const meta: MemoryFilterMeta = {
+    ...baseMeta,
+    status: "error",
+    candidate_count: candidates.length,
+    output_count: 0,
+    reason: "filter_and_compression_failed",
+    output_shape: compressionResult.outputShape || filterResult.outputShape,
+    filter_status: "error",
+    filter_input_count: candidates.length,
+    filter_output_count: 0,
+    filter_reason: filterResult.reason,
+    compression_status: "error",
+    compression_input_count: compressionInput.length,
+    compression_output_count: 0,
+    compression_reason: compressionResult.reason
+  };
+  logMemoryFilterStages(meta);
+  return { data: [], meta };
 }

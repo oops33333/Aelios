@@ -322,10 +322,10 @@ Model:      companion
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `CHAT_MODEL` | `deepseek/deepseek-v4-pro` | 主聊天 |
-| `MEMORY_FILTER_MODEL` | `workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 记忆筛选，默认走 Workers AI；也兼容把 JSON 放进 reasoning_content 的模型 |
+| `MEMORY_FILTER_MODEL` | `workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 串行执行记忆筛选和压缩，默认走 Workers AI；也兼容把 JSON 放进 reasoning_content 的模型 |
 | `MEMORY_FILTER_MAX_CANDIDATES` | `12` | 进入小秘书的候选记忆上限 |
-| `MEMORY_FILTER_MAX_OUTPUT` | `4` | 小秘书最终返回记忆上限 |
-| `MEMORY_FILTER_OUTPUT_CHARS` | `300` | 小秘书每条返回内容最多多少字 |
+| `MEMORY_FILTER_MAX_OUTPUT` | `4` | 正常筛选成功时最多注入 4 条；筛选失败时压缩兜底最多注入 10 条 |
+| `MEMORY_FILTER_OUTPUT_CHARS` | `300` | 压缩结果每条内容的硬截断字符数 |
 | `MEMORY_FILTER_MAX_TOKENS` | `1400` | 小秘书 JSON 输出上限，避免多条压缩结果被截断 |
 | `SUMMARY_MODEL` | `deepseek/deepseek-v4-pro` | 每日整理小秘书，负责把 D1 临时聊天整理入长期记忆 |
 | `VISION_MODEL` | `google-ai-studio/gemini-3-flash-preview` | 看图；普通聊天和导盲犬 API 都用它 |
