@@ -1,6 +1,7 @@
 import { authenticate } from "../auth/apiKey";
 import { requireScope } from "../auth/scopes";
 import { getOrCreateConversation } from "../db/conversations";
+import { finishIdempotentTask, tryStartIdempotentTask } from "../db/idempotency";
 import { listMemories } from "../db/memories";
 import { saveAssistantMessage, saveUserMessages } from "../db/messages";
 import { getLatestSummary } from "../db/summaries";
@@ -96,6 +97,59 @@ async function fetchPinnedPersonaMemories(
   return records
     .filter((r) => r.pinned && PERSONA_MEMORY_TYPES.includes(r.type))
     .map((r) => toMemoryApiRecord(r));
+}
+
+function shanghaiDateKey(date = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const values = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
+  );
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+async function claimDailyReminders(
+  env: Env,
+  namespace: string,
+  reminders: string[]
+): Promise<string[]> {
+  if (reminders.length === 0) return [];
+
+  const key = `date_reminders:${namespace}:${shanghaiDateKey()}`;
+  let claimed: boolean;
+  try {
+    claimed = await tryStartIdempotentTask(env.DB, {
+      key,
+      taskType: "date_reminders"
+    });
+  } catch (error) {
+    console.error(
+      "daily reminder claim failed",
+      error instanceof Error ? error.message : error
+    );
+    return [];
+  }
+
+  if (!claimed) return [];
+
+  try {
+    await finishIdempotentTask(env.DB, { key, status: "done" });
+  } catch (error) {
+    // The unique INSERT already consumed today's claim. Keep injecting this
+    // request so a status-only update failure cannot silently lose reminders.
+    console.error(
+      "daily reminder claim status update failed",
+      error instanceof Error ? error.message : error
+    );
+  }
+
+  return reminders;
 }
 
 export async function handleChatCompletions(
@@ -223,14 +277,14 @@ export async function handleChatCompletions(
   // History compression + memory search + persona + summary in parallel
   const userQuery = extractLastUserText(body.messages);
   const memoryQuery = visionOutput ? `${userQuery}\n${visionOutput}`.slice(0, 500) : userQuery;
-  const userMsgCount = body.messages.filter((m) => m.role === "user").length;
-  const [compressResult, memories, pinnedPersonaMemories, latestSummary, reminders] = await Promise.all([
+  const [compressResult, memories, pinnedPersonaMemories, latestSummary, fetchedReminders] = await Promise.all([
     compressHistoryIfNeeded(env, body.messages, auth.profile.namespace),
     selectMemoriesForInjection(env, { profile: auth.profile, query: memoryQuery }),
     fetchPinnedPersonaMemories(env, auth.profile.namespace),
     getLatestSummary(env.DB, auth.profile.namespace),
-    userMsgCount <= 1 ? fetchSweepyReminders(env) : Promise.resolve([]),
+    isHeartbeat ? Promise.resolve([]) : fetchSweepyReminders(env),
   ]);
+  const reminders = await claimDailyReminders(env, auth.profile.namespace, fetchedReminders);
 
   // If compression happened, use trimmed messages for the assembler
   const assemblerBody = compressResult.summary
