@@ -10,6 +10,7 @@ import {
   writeCursor,
   RETENTION_BATCH_SIZE,
 } from "../db/retention";
+import { runRemoteMemoryRetention } from "../db/memories";
 import type { Env } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -75,6 +76,18 @@ export async function runMemoryRetention(
 
   const now = new Date().toISOString();
   const stats: Record<string, number> = {};
+
+  // Run the external memory lifecycle under the same 24h throttle. The
+  // aeliosmemory endpoint only soft-archives/protects records; it never deletes.
+  const remoteRetention = await runRemoteMemoryRetention(env);
+  if (remoteRetention?.ok) {
+    stats.remoteExamined = remoteRetention.stats.examined;
+    stats.remoteArchived = remoteRetention.stats.archived;
+    stats.remoteImportanceProtected = remoteRetention.stats.importance_protected;
+    stats.remoteActivityProtected = remoteRetention.stats.activity_protected;
+  } else {
+    stats.remoteRetentionFailed = 1;
+  }
 
   // 1. Delete old messages
   stats.messages = await deleteOldMessages(env.DB, namespace, daysAgo(MESSAGES_RETENTION_DAYS));

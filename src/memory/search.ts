@@ -6,7 +6,7 @@
  * 由 sweepy 的 qwen3-embedding 提供语义匹配。
  */
 
-import { fetchMemoriesByIds, markMemoriesRecalled, searchMemoriesByText } from "../db/memories";
+import { searchMemoriesByText } from "../db/memories";
 import type { Env, MemoryApiRecord, MemoryRecord } from "../types";
 
 function parseJsonArray(value: string | null): string[] {
@@ -39,7 +39,18 @@ export function toMemoryApiRecord(record: MemoryRecord, score?: number): MemoryA
     created_at: record.created_at,
     updated_at: record.updated_at,
     expires_at: record.expires_at,
+    archived: Boolean(record.archived),
+    archived_at: record.archived_at ?? null,
+    last_injected_at: record.last_injected_at ?? null,
+    injection_count: record.injection_count ?? 0,
+    retention_class: record.retention_class || "normal",
+    retention_protected_at: record.retention_protected_at ?? null,
     ...(score === undefined ? {} : { score }),
+    ...(typeof record.raw_similarity === "number" ? { raw_similarity: record.raw_similarity } : {}),
+    ...(typeof record.recall_score === "number" ? { recall_score: record.recall_score } : {}),
+    ...(typeof record.effective_importance === "number"
+      ? { effective_importance: record.effective_importance }
+      : {}),
   };
 }
 
@@ -57,7 +68,13 @@ function getTopK(env: Env, requested?: number): number {
  */
 export async function searchMemories(
   env: Env,
-  input: { namespace: string; query: string; types?: string[]; topK?: number }
+  input: {
+    namespace: string;
+    query: string;
+    types?: string[];
+    topK?: number;
+    purpose?: "semantic" | "recall";
+  }
 ): Promise<MemoryApiRecord[]> {
   const topK = getTopK(env, input.topK);
 
@@ -67,12 +84,7 @@ export async function searchMemories(
     query: input.query,
     types: input.types,
     limit: topK,
-  });
-
-  // 标记被召回（sweepy 内部处理）
-  await markMemoriesRecalled(env, {
-    namespace: input.namespace,
-    ids: records.map((record) => record.id),
+    purpose: input.purpose,
   });
 
   return records.map((record) => toMemoryApiRecord(record, record.score));

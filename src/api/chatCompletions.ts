@@ -2,7 +2,7 @@ import { authenticate } from "../auth/apiKey";
 import { requireScope } from "../auth/scopes";
 import { getOrCreateConversation } from "../db/conversations";
 import { finishIdempotentTask, tryStartIdempotentTask } from "../db/idempotency";
-import { listMemories } from "../db/memories";
+import { commitMemoryInjection, listMemories } from "../db/memories";
 import { saveAssistantMessage, saveUserMessages } from "../db/messages";
 import { getLatestSummary } from "../db/summaries";
 import { saveUsageLog } from "../db/usageLogs";
@@ -277,13 +277,14 @@ export async function handleChatCompletions(
   // History compression + memory search + persona + summary in parallel
   const userQuery = extractLastUserText(body.messages);
   const memoryQuery = visionOutput ? `${userQuery}\n${visionOutput}`.slice(0, 500) : userQuery;
-  const [compressResult, memories, pinnedPersonaMemories, latestSummary, fetchedReminders] = await Promise.all([
+  const [compressResult, memorySelection, pinnedPersonaMemories, latestSummary, fetchedReminders] = await Promise.all([
     compressHistoryIfNeeded(env, body.messages, auth.profile.namespace),
     selectMemoriesForInjection(env, { profile: auth.profile, query: memoryQuery }),
     fetchPinnedPersonaMemories(env, auth.profile.namespace),
     getLatestSummary(env.DB, auth.profile.namespace),
     isHeartbeat ? Promise.resolve([]) : fetchSweepyReminders(env),
   ]);
+  const memories = memorySelection.memories;
   const reminders = await claimDailyReminders(env, auth.profile.namespace, fetchedReminders);
 
   // If compression happened, use trimmed messages for the assembler
@@ -347,7 +348,16 @@ export async function handleChatCompletions(
     } else {
       if (hasToolContent(assemblerBody)) {
         // Tool messages / tool_calls not yet supported by assembler — fall back
-        const patchedBody = await injectMemoryPatchAsSystemMessage(fallbackBody, memories, env, reminders);
+        // The dynamic selector intentionally excludes fixed pinned persona /
+        // identity records. The assembler normally injects those separately;
+        // this fallback must add them explicitly without adding them to the
+        // dynamic commitMemoryIds set.
+        const patchedBody = await injectMemoryPatchAsSystemMessage(
+          fallbackBody,
+          [...pinnedPersonaMemories, ...memories],
+          env,
+          reminders
+        );
         const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel);
         upstream = await callOpenAICompat(env, upstreamRequest);
       } else {
@@ -377,6 +387,20 @@ export async function handleChatCompletions(
         "content-type": upstream.headers.get("content-type") || "application/json; charset=utf-8"
       }
     });
+  }
+
+  // 只有成功送达上游 prompt 的最终动态记忆才计活跃。候选搜索、静态
+  // pinned/persona、filter disabled 和 heartbeat 都不会进入 commitMemoryIds。
+  if (!isHeartbeat && latestUserMessageId && memorySelection.commitMemoryIds.length > 0) {
+    ctx.waitUntil(
+      commitMemoryInjection(env, {
+        commitId: latestUserMessageId,
+        memoryIds: memorySelection.commitMemoryIds,
+      }).catch((error) => {
+        console.error("memory injection commit failed", error);
+        return null;
+      })
+    );
   }
 
   if (body.stream) {

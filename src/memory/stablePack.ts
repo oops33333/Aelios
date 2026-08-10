@@ -1,5 +1,6 @@
 import { listMemories } from "../db/memories";
 import type { Env } from "../types";
+import { formatMemoryPromptLine } from "../utils/memoryPrompt";
 import { toMemoryApiRecord } from "./search";
 
 export async function buildStableMemoryPack(env: Env, namespace: string): Promise<string> {
@@ -20,6 +21,6 @@ export async function buildStableMemoryPack(env: Env, namespace: string): Promis
 
   return [
     "固定长期记忆：",
-    ...pinned.map((memory) => `- [${memory.type}][importance=${memory.importance.toFixed(2)}] ${memory.content}`)
+    ...pinned.map((memory) => formatMemoryPromptLine(memory))
   ].join("\n");
 }

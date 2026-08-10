@@ -14,6 +14,7 @@
 
 import type { MemoryApiRecord, OpenAIChatMessage } from "../types";
 import { preprocessHistory } from "../preset/historyPreprocess";
+import { formatMemoryPromptLine } from "../utils/memoryPrompt";
 import type {
   AssembledPrompt,
   AssemblerContext,
@@ -80,6 +81,7 @@ const PROXY_STATIC_RULES_TEXT = [
   "不要暴露记忆系统、数据库、RAG、代理层或任何后端实现。",
   "不要机械复述设定原文，用自己的话自然表达。",
   "如果记忆与当前对话无关，不要强行提起。",
+  "记忆末尾的“记录于”表示入库日期；较早记录只作历史背景，不代表当前状态，以当前对话为准。",
 ].join("\n");
 
 const proxyStaticRulesBlock: Block = {
@@ -100,7 +102,7 @@ function formatPersonaPinned(memories: MemoryApiRecord[]): string {
   return memories
     .map((m) => ({ ...m, content: sanitizeMemoryContent(m.content) }))
     .filter((m) => m.content)
-    .map((m) => `- [${m.type}][importance=${m.importance.toFixed(2)}] ${m.content}`)
+    .map((m) => formatMemoryPromptLine(m))
     .join("\n");
 }
 
@@ -313,7 +315,7 @@ function formatRagMemories(memories: MemoryApiRecord[]): string {
   const lines = memories
     .map((m) => ({ ...m, content: sanitizeMemoryContent(m.content) }))
     .filter((m) => m.content)
-    .map((m) => `- [${m.type}][importance=${m.importance.toFixed(2)}] ${m.content}`);
+    .map((m) => formatMemoryPromptLine(m));
   if (lines.length === 0) return "";
 
   return [

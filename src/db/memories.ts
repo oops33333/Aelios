@@ -54,8 +54,17 @@ interface ApiMemory {
   created_at: string;
   updated_at: string;
   expires_at: string | null;
+  archived?: boolean | number;
+  archived_at?: string | null;
+  last_injected_at?: string | null;
+  injection_count?: number;
+  retention_class?: string;
+  retention_protected_at?: string | null;
   score?: number;
   similarity?: number;
+  raw_similarity?: number;
+  recall_score?: number;
+  effective_importance?: number;
 }
 
 function apiToRecord(m: ApiMemory): MemoryRecord {
@@ -78,6 +87,15 @@ function apiToRecord(m: ApiMemory): MemoryRecord {
     created_at: m.created_at,
     updated_at: m.updated_at,
     expires_at: m.expires_at ?? null,
+    archived: Boolean(m.archived),
+    archived_at: m.archived_at ?? null,
+    last_injected_at: m.last_injected_at ?? null,
+    injection_count: m.injection_count ?? 0,
+    retention_class: m.retention_class || "normal",
+    retention_protected_at: m.retention_protected_at ?? null,
+    ...(typeof m.raw_similarity === "number" ? { raw_similarity: m.raw_similarity } : {}),
+    ...(typeof m.recall_score === "number" ? { recall_score: m.recall_score } : {}),
+    ...(typeof m.effective_importance === "number" ? { effective_importance: m.effective_importance } : {}),
   };
 }
 
@@ -172,6 +190,12 @@ export async function createMemory(env: Env, input: CreateMemoryInput): Promise<
       created_at: now,
       updated_at: now,
       expires_at: null,
+      archived: false,
+      archived_at: null,
+      last_injected_at: null,
+      injection_count: 0,
+      retention_class: "normal",
+      retention_protected_at: null,
     };
   }
 
@@ -301,18 +325,31 @@ export async function softDeleteMemory(
 }
 
 /**
- * 语义检索 — 服务端 qwen3-embedding-8b 余弦（阈值 0.4），命中自动累加 recall_count
+ * 记忆检索 — semantic 用于去重/合并，recall 用于 API prompt 注入。
+ * 两种模式均为纯读；候选命中不再计作记忆活跃。
  */
 export async function searchMemoriesByText(
   env: Env,
-  input: { namespace: string; query: string; types?: string[]; limit: number }
-): Promise<Array<MemoryRecord & { score: number }>> {
+  input: {
+    namespace: string;
+    query: string;
+    types?: string[];
+    limit: number;
+    purpose?: "semantic" | "recall";
+  }
+): Promise<Array<MemoryRecord & {
+  score: number;
+  raw_similarity: number;
+  recall_score: number;
+  effective_importance?: number;
+}>> {
   const query = input.query.trim().slice(0, 500);
   if (!query) return [];
+  const purpose = input.purpose === "recall" ? "recall" : "semantic";
 
   const res = await memoryApiFetch(
     env,
-    `/api/memories/search?q=${encodeURIComponent(query)}&limit=${Math.max(input.limit, 1)}`
+    `/api/memories/search?q=${encodeURIComponent(query)}&limit=${Math.max(input.limit, 1)}&purpose=${purpose}`
   );
 
   if (!res.ok) {
@@ -322,18 +359,108 @@ export async function searchMemoriesByText(
 
   const results = (await res.json()) as ApiMemory[];
 
-  return results.slice(0, input.limit).map((r) => ({
-    ...apiToRecord(r),
-    score: r.score ?? r.similarity ?? 0.7,
-  }));
+  return results.slice(0, input.limit).map((r) => {
+    // Rolling-deploy compatibility: older servers only returned score/similarity.
+    const rawSimilarity = r.raw_similarity ?? r.similarity ?? r.score ?? 0.7;
+    const recallScore = r.recall_score ?? r.score ?? rawSimilarity;
+    return {
+      ...apiToRecord(r),
+      score: rawSimilarity,
+      raw_similarity: rawSimilarity,
+      recall_score: recallScore,
+      ...(typeof r.effective_importance === "number"
+        ? { effective_importance: r.effective_importance }
+        : {}),
+    };
+  });
 }
 
 /**
- * 标记记忆被召回（服务端 search/单读已自增 recall_count，此处无事可做）
+ * 旧接口保留给尚未迁移的调用方。候选搜索现在是纯读，故这里刻意 no-op。
  */
 export async function markMemoriesRecalled(
   _env: Env,
   _input: { namespace: string; ids: string[] }
 ): Promise<void> {
-  // aeliosmemory 在 search 与单读时自增 recall_count，无需额外调用
+  // 只有最终实际进入 prompt 的记忆才通过 commitMemoryInjection 计活跃。
+}
+
+export interface MemoryInjectionCommitResult {
+  ok: boolean;
+  committed: boolean;
+  duplicate: boolean;
+  count: number;
+  reactivated: number;
+  protected: number;
+}
+
+export interface MemoryRetentionStats {
+  examined: number;
+  archived: number;
+  importance_protected: number;
+  activity_protected: number;
+  dry_run: boolean;
+}
+
+export interface MemoryRetentionResult {
+  ok: boolean;
+  stats: MemoryRetentionStats;
+}
+
+/**
+ * 幂等提交本轮实际进入上游 prompt 的动态记忆（最多 4 条）。
+ * 服务端会再次排除 pinned/persona，且同一 commit_id 整批只计一次。
+ */
+export async function commitMemoryInjection(
+  env: Env,
+  input: { commitId: string; memoryIds: string[] }
+): Promise<MemoryInjectionCommitResult | null> {
+  const commitId = input.commitId.trim();
+  const memoryIds = [...new Set(input.memoryIds.map((id) => id.trim()).filter(Boolean))].slice(0, 4);
+  if (!commitId || memoryIds.length === 0) return null;
+
+  try {
+    const res = await memoryApiFetch(env, "/api/memories/injection-commits", {
+      method: "POST",
+      body: JSON.stringify({
+        commit_id: commitId,
+        memory_ids: memoryIds,
+      }),
+    });
+
+    if (!res.ok) {
+      console.error("aeliosmemory injection commit failed", res.status);
+      return null;
+    }
+
+    return (await res.json()) as MemoryInjectionCommitResult;
+  } catch (error) {
+    console.error("aeliosmemory injection commit failed", error);
+    return null;
+  }
+}
+
+/**
+ * 触发 aeliosmemory 的生命周期维护。服务端只做软归档与保护标记，
+ * 不会删除记忆；不传 namespace，以一次处理自产区和镜像区。
+ */
+export async function runRemoteMemoryRetention(
+  env: Env
+): Promise<MemoryRetentionResult | null> {
+  try {
+    const res = await memoryApiFetch(env, "/api/memories/retention/run", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+
+    if (!res.ok) {
+      console.error("aeliosmemory retention failed", res.status);
+      return null;
+    }
+
+    return (await res.json()) as MemoryRetentionResult;
+  } catch (error) {
+    console.error("aeliosmemory retention failed", error);
+    return null;
+  }
 }

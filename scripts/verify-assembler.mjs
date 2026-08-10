@@ -61,9 +61,20 @@ async function importBundledProductionModule(relativePath) {
   return import(url);
 }
 
-const [productionAnthropicAdapter, productionHeartbeatPrefix] = await Promise.all([
+const [
+  productionAnthropicAdapter,
+  productionHeartbeatPrefix,
+  productionMemoryPrompt,
+  productionMemoryInject,
+  productionMemoryDb,
+  productionMemoryRetention,
+] = await Promise.all([
   importBundledProductionModule("../src/proxy/anthropicAdapter.ts"),
   importBundledProductionModule("../src/proxy/heartbeatPrefix.ts"),
+  importBundledProductionModule("../src/utils/memoryPrompt.ts"),
+  importBundledProductionModule("../src/memory/inject.ts"),
+  importBundledProductionModule("../src/db/memories.ts"),
+  importBundledProductionModule("../src/memory/retention.ts"),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -109,6 +120,7 @@ const PROXY_STATIC_RULES_TEXT = [
   "不要暴露记忆系统、数据库、RAG、代理层或任何后端实现。",
   "不要机械复述设定原文，用自己的话自然表达。",
   "如果记忆与当前对话无关，不要强行提起。",
+  "记忆末尾的“记录于”表示入库日期；较早记录只作历史背景，不代表当前状态，以当前对话为准。",
 ].join("\n");
 
 const PRESET_LITE_TEXT = [
@@ -231,9 +243,7 @@ function assemble(ctx) {
           if (b.importance !== a.importance) return b.importance - a.importance;
           return a.id.localeCompare(b.id);
         });
-        const lines = sorted.map(
-          (m) => `- [${m.type}][importance=${m.importance.toFixed(2)}] ${m.content}`
-        );
+        const lines = sorted.map((m) => productionMemoryPrompt.formatMemoryPromptLine(m));
         text = lines.join("\n") || null;
       }
     } else if (blockId === "long_term_summary") {
@@ -268,9 +278,7 @@ function assemble(ctx) {
       }
     } else if (blockId === "dynamic_memory_patch") {
       if (ctx.ragMemories.length > 0) {
-        const lines = ctx.ragMemories.map(
-          (m) => `- [${m.type}][importance=${m.importance.toFixed(2)}] ${m.content}`
-        );
+        const lines = ctx.ragMemories.map((m) => productionMemoryPrompt.formatMemoryPromptLine(m));
         text = ["<memories>", ...lines, "</memories>"].join("\n");
       }
     } else if (blockId === "reminders") {
@@ -363,12 +371,12 @@ function makeBaseCtx() {
   return {
     systemMessages: [{ role: "system", content: "你是测试角色。" }],
     pinnedPersonaMemories: [
-      { id: "b-1", type: "persona", content: "性格温柔", importance: 0.9 },
-      { id: "a-1", type: "identity", content: "名字是咲咲", importance: 0.95 },
+      { id: "b-1", type: "persona", content: "性格温柔", importance: 0.9, created_at: "2026-03-01T16:00:00Z" },
+      { id: "a-1", type: "identity", content: "名字是咲咲", importance: 0.95, created_at: "2026-03-01T15:59:59Z" },
     ],
     summaryEntry: { content: "这是一段很长的对话摘要，用于测试截断和稳定性。" },
     ragMemories: [
-      { type: "note", importance: 0.6, content: "用户喜欢猫" },
+      { type: "note", importance: 0.6, content: "用户喜欢猫", created_at: "2026-03-02T08:00:00+08:00" },
     ],
     reminders: [],
     visionOutput: null,
@@ -431,6 +439,145 @@ check("full output is deep-equal across two calls", () => {
   const a = assemble(ctx);
   const b = assemble(ctx);
   assert.deepStrictEqual(a, b);
+});
+
+// ---------------------------------------------------------------------------
+// Test 1b: Prompt-facing memory dates
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Test 1b: Prompt-facing memory dates ---");
+
+check("memory date uses the Asia/Shanghai day boundary", () => {
+  assert.strictEqual(
+    productionMemoryPrompt.formatMemoryRecordedDate("2026-03-01T15:59:59Z"),
+    "2026年3月1日"
+  );
+  assert.strictEqual(
+    productionMemoryPrompt.formatMemoryRecordedDate("2026-03-01T16:00:00Z"),
+    "2026年3月2日"
+  );
+});
+
+check("memory date accepts ISO offsets, SQLite UTC, date-only, and leap day", () => {
+  assert.strictEqual(
+    productionMemoryPrompt.formatMemoryRecordedDate("2026-03-02T08:30:00+08:00"),
+    "2026年3月2日"
+  );
+  assert.strictEqual(
+    productionMemoryPrompt.formatMemoryRecordedDate("2026-03-01 16:00:00"),
+    "2026年3月2日"
+  );
+  assert.strictEqual(
+    productionMemoryPrompt.formatMemoryRecordedDate("2026-03-02"),
+    "2026年3月2日"
+  );
+  assert.strictEqual(
+    productionMemoryPrompt.formatMemoryRecordedDate("2024-02-29T00:00:00Z"),
+    "2024年2月29日"
+  );
+});
+
+check("missing or invalid memory dates are omitted without throwing", () => {
+  for (const value of [undefined, null, "", "not-a-date", "2026-02-30T00:00:00Z", "2026-03-02T24:00:00Z"]) {
+    assert.strictEqual(productionMemoryPrompt.formatMemoryRecordedDate(value), null);
+  }
+  assert.strictEqual(
+    productionMemoryPrompt.formatMemoryPromptLine({
+      type: "note",
+      importance: 0.6,
+      content: "旧格式记录",
+      created_at: "invalid",
+    }),
+    "- [note][importance=0.60] 旧格式记录"
+  );
+});
+
+check("memory line appends the recorded date after content and preserves pinned marker", () => {
+  assert.strictEqual(
+    productionMemoryPrompt.formatMemoryPromptLine({
+      type: "fact",
+      importance: 0.75,
+      content: "用户曾住在上海",
+      pinned: true,
+      created_at: "2026-03-01T16:00:00Z",
+    }, { includePinned: true }),
+    "- [fact][importance=0.75][pinned] 用户曾住在上海（记录于2026年3月2日）"
+  );
+});
+
+check("formatMemoryPatch carries the date instruction and dated memory line", () => {
+  const patch = productionMemoryInject.formatMemoryPatch([{
+    type: "fact",
+    importance: 0.75,
+    content: "用户曾住在上海",
+    pinned: true,
+    created_at: "2026-03-01T16:00:00Z",
+  }]);
+  assert.ok(patch.includes("较早记录只作历史背景，不代表当前状态"));
+  assert.ok(patch.includes("- [fact][importance=0.75][pinned] 用户曾住在上海（记录于2026年3月2日）"));
+});
+
+await checkAsync("Anthropic native fallback dates both stable pinned and dynamic memories", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (!url.includes("/api/memories?")) throw new Error(`unexpected fetch: ${url}`);
+    return new Response(JSON.stringify([{
+      id: "pinned-date",
+      namespace: "default",
+      type: "identity",
+      content: "固定身份",
+      summary: null,
+      importance: 0.9,
+      confidence: 0.9,
+      status: "active",
+      pinned: 1,
+      tags: [],
+      source: "test",
+      source_message_ids: [],
+      vector_id: null,
+      last_recalled_at: null,
+      recall_count: 0,
+      created_at: "2026-03-01T16:00:00Z",
+      updated_at: "2026-03-01T16:00:00Z",
+      expires_at: null,
+    }]), { headers: { "content-type": "application/json" } });
+  };
+
+  try {
+    const request = await productionAnthropicAdapter.buildAnthropicNativeRequest({
+      model: "companion",
+      messages: [{ role: "user", content: "继续" }],
+    }, {
+      env: { SWEEPY_URL: "https://memory.invalid" },
+      targetModel: "anthropic/claude-sonnet-4-6",
+      namespace: "default",
+      memories: [{
+        type: "note",
+        importance: 0.6,
+        content: "动态旧事",
+        pinned: false,
+        created_at: "2026-03-01T15:59:59Z",
+      }],
+    });
+
+    assert.ok(request.system.some((block) => block.text.includes("固定身份（记录于2026年3月2日）")));
+    assert.ok(request.system.some((block) => block.text.includes("较早记录只作历史背景，不代表当前状态")));
+    const lastUser = [...request.messages].reverse().find((message) => message.role === "user");
+    assert.ok(lastUser.content.some((block) => block.text?.includes("动态旧事（记录于2026年3月1日）")));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+check("assembler persona and RAG blocks append each record's date", () => {
+  const ctx = makeBaseCtx();
+  const assembled = assemble(ctx);
+  const personaIdx = assembled.meta.block_ids.indexOf("persona_pinned");
+  const ragIdx = assembled.meta.block_ids.indexOf("dynamic_memory_patch");
+  assert.ok(assembled.system_blocks[personaIdx].text.includes("名字是咲咲（记录于2026年3月1日）"));
+  assert.ok(assembled.system_blocks[personaIdx].text.includes("性格温柔（记录于2026年3月2日）"));
+  assert.ok(assembled.system_blocks[ragIdx].text.includes("用户喜欢猫（记录于2026年3月2日）"));
 });
 
 // ---------------------------------------------------------------------------
@@ -1851,7 +1998,12 @@ check("Anthropic helper: full rolling window restarts cache on first user messag
 check("Anthropic helper: dynamic memory is appended after rolling cache point", () => {
   const ctx = makeBaseCtx();
   ctx.ragMemories = [
-    { type: "note", importance: 0.8, content: "用户喜欢缓存命中率高一点" },
+    {
+      type: "note",
+      importance: 0.8,
+      content: "用户喜欢缓存命中率高一点",
+      created_at: "2026-03-01T16:00:00Z",
+    },
   ];
   ctx.currentUserMessage = { role: "user", content: "继续优化缓存" };
   const assembled = assemble(ctx);
@@ -1868,7 +2020,7 @@ check("Anthropic helper: dynamic memory is appended after rolling cache point", 
   assert.ok(lastUser);
   assert.strictEqual(lastUser.content[0].text, "继续优化缓存");
   assert.deepStrictEqual(lastUser.content[0].cache_control, { type: "ephemeral" });
-  assert.ok(lastUser.content[1].text.includes("用户喜欢缓存命中率高一点"));
+  assert.ok(lastUser.content[1].text.includes("用户喜欢缓存命中率高一点（记录于2026年3月2日）"));
   assert.strictEqual(lastUser.content[1].cache_control, undefined);
 });
 
@@ -4302,6 +4454,297 @@ check("vision split: historical-only non-tool images still trigger the existing 
   const stripped = productionStripNonToolImages(messages);
   assert.strictEqual(stripped[0].content, "history");
   assert.strictEqual(stripped[1].content, "current text only");
+});
+
+// ---------------------------------------------------------------------------
+// Test 32: Recall ranking metadata and injection activity contract
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Test 32: Recall ranking and injection activity ---");
+
+function makeRecallApiMemory(id, overrides = {}) {
+  return {
+    id,
+    namespace: "default",
+    type: "note",
+    content: `memory ${id}`,
+    summary: null,
+    importance: 0.7,
+    confidence: 0.9,
+    status: "active",
+    pinned: 0,
+    tags: [],
+    source: "test",
+    source_message_ids: [],
+    vector_id: null,
+    last_recalled_at: null,
+    recall_count: 0,
+    created_at: "2026-03-02T00:00:00.000Z",
+    updated_at: "2026-03-02T00:00:00.000Z",
+    expires_at: null,
+    archived: false,
+    archived_at: null,
+    last_injected_at: null,
+    injection_count: 0,
+    retention_class: "normal",
+    retention_protected_at: null,
+    score: 0.83,
+    raw_similarity: 0.83,
+    recall_score: 0.71,
+    effective_importance: 0.34,
+    ...overrides,
+  };
+}
+
+await checkAsync("recall search requests purpose=recall and preserves raw/recall scores", async () => {
+  const originalFetch = globalThis.fetch;
+  const requestedUrls = [];
+  globalThis.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    return new Response(JSON.stringify([makeRecallApiMemory("m1")]), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    const result = await productionMemoryDb.searchMemoriesByText(
+      { SWEEPY_URL: "https://memory.test/aeliosmemory" },
+      { namespace: "default", query: "偏头痛", limit: 12, purpose: "recall" }
+    );
+    await productionMemoryDb.searchMemoriesByText(
+      { SWEEPY_URL: "https://memory.test/aeliosmemory" },
+      { namespace: "default", query: "去重", limit: 5 }
+    );
+    assert.ok(requestedUrls[0].includes("purpose=recall"));
+    assert.ok(requestedUrls[1].includes("purpose=semantic"));
+    assert.strictEqual(result[0].score, 0.83);
+    assert.strictEqual(result[0].raw_similarity, 0.83);
+    assert.strictEqual(result[0].recall_score, 0.71);
+    assert.strictEqual(result[0].effective_importance, 0.34);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await checkAsync("remote retention posts an empty scope and returns soft-lifecycle stats", async () => {
+  const originalFetch = globalThis.fetch;
+  let request = null;
+  globalThis.fetch = async (url, init) => {
+    request = { url: String(url), init };
+    return new Response(JSON.stringify({
+      ok: true,
+      stats: {
+        examined: 295,
+        archived: 3,
+        importance_protected: 27,
+        activity_protected: 4,
+        dry_run: false,
+      },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    const result = await productionMemoryDb.runRemoteMemoryRetention({
+      SWEEPY_URL: "https://memory.test/aeliosmemory",
+    });
+    assert.strictEqual(request.url, "https://memory.test/aeliosmemory/api/memories/retention/run");
+    assert.strictEqual(request.init.method, "POST");
+    assert.deepStrictEqual(JSON.parse(request.init.body), {});
+    assert.strictEqual(result.stats.archived, 3);
+    assert.strictEqual(result.stats.activity_protected, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await checkAsync("24h retention task integrates remote soft lifecycle without changing D1 cleanup", async () => {
+  const source = await readFile(new URL("../src/memory/retention.ts", import.meta.url), "utf8");
+  const throttleGuard = source.indexOf("if (lastRun)");
+  const remoteCall = source.indexOf("await runRemoteMemoryRetention(env)");
+  const existingD1Cleanup = source.indexOf("await deleteOldMessages", remoteCall);
+  assert.ok(throttleGuard >= 0);
+  assert.ok(remoteCall > throttleGuard, "remote lifecycle must run only after the existing throttle permits it");
+  assert.ok(existingD1Cleanup > remoteCall, "existing D1 cleanup remains separate and unchanged");
+  assert.strictEqual(typeof productionMemoryRetention.runMemoryRetention, "function");
+});
+
+await checkAsync("chat commits only after upstream.ok and explicitly excludes heartbeat", async () => {
+  const source = await readFile(new URL("../src/api/chatCompletions.ts", import.meta.url), "utf8");
+  const successGuard = source.indexOf("if (!upstream.ok)");
+  const commitGuard = source.indexOf("if (!isHeartbeat && latestUserMessageId && memorySelection.commitMemoryIds.length > 0)");
+  const streamBranch = source.indexOf("if (body.stream)", commitGuard);
+  assert.ok(successGuard >= 0);
+  assert.ok(commitGuard > successGuard, "commit must happen after the upstream success guard");
+  assert.ok(streamBranch > commitGuard, "stream and non-stream paths must share the same commit point");
+});
+
+await checkAsync("OpenAI tool fallback includes fixed pinned persona without making it dynamic", async () => {
+  const source = await readFile(new URL("../src/api/chatCompletions.ts", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /injectMemoryPatchAsSystemMessage\(\s*fallbackBody,\s*\[\.\.\.pinnedPersonaMemories, \.\.\.memories\],\s*env,\s*reminders\s*\)/,
+    "OpenAI tool fallback must combine the separately fetched fixed persona records with dynamic memories"
+  );
+
+  const fixed = makeRecallApiMemory("fixed-tool-persona", {
+    type: "persona",
+    pinned: 1,
+    content: "固定人格即使归档标记异常也必须注入",
+    archived: true,
+    archived_at: "2026-08-01T00:00:00.000Z",
+    created_at: "2026-03-01T16:00:00.000Z",
+  });
+  const dynamic = makeRecallApiMemory("dynamic-tool-memory", {
+    content: "本轮动态记忆",
+    created_at: "2026-03-01T15:59:59.000Z",
+  });
+  const patched = await productionMemoryInject.injectMemoryPatchAsSystemMessage({
+    model: "companion",
+    messages: [
+      { role: "user", content: "使用工具" },
+      { role: "assistant", content: null, tool_calls: [{ id: "tool-1", type: "function", function: { name: "lookup", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "tool-1", content: "done" },
+    ],
+  }, [fixed, dynamic], undefined, []);
+  const memorySystem = patched.messages.find(message =>
+    message.role === "system" && typeof message.content === "string" && message.content.includes("<memories>")
+  );
+  assert(memorySystem);
+  assert.ok(memorySystem.content.includes("固定人格即使归档标记异常也必须注入（记录于2026年3月2日）"));
+  assert.ok(memorySystem.content.includes("本轮动态记忆（记录于2026年3月1日）"));
+  assert.ok(!source.includes("commitMemoryIds: [...pinnedPersonaMemories"));
+});
+
+await checkAsync("filter disabled hard-caps prompt memories at 4 and never creates commit IDs", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  const rows = [
+    makeRecallApiMemory("fixed", { type: "persona", pinned: 1 }),
+    ...Array.from({ length: 6 }, (_, index) => makeRecallApiMemory(`m${index + 1}`)),
+  ];
+  globalThis.fetch = async (url) => {
+    requestedUrl = String(url);
+    return new Response(JSON.stringify(rows), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    const selection = await productionMemoryInject.selectMemoriesForInjection(
+      {
+        SWEEPY_URL: "https://memory.test/aeliosmemory",
+        ENABLE_MEMORY_FILTER: "false",
+        MEMORY_TOP_K: "12",
+      },
+      {
+        profile: { namespace: "default", injectionMode: "rag" },
+        query: "偏头痛又发作了",
+      }
+    );
+    assert.ok(requestedUrl.includes("purpose=recall"));
+    assert.strictEqual(selection.memories.length, 4);
+    assert.ok(selection.memories.every((memory) => memory.id !== "fixed"));
+    assert.deepStrictEqual(selection.commitMemoryIds, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await checkAsync("model-selected final memories cap at 4 and exclude pinned/persona from commits", async () => {
+  const originalFetch = globalThis.fetch;
+  const rows = [
+    makeRecallApiMemory("fixed", { type: "persona", pinned: 1 }),
+    makeRecallApiMemory("m1"),
+    makeRecallApiMemory("m2", { type: "persona" }),
+    makeRecallApiMemory("m3", { pinned: 1 }),
+    makeRecallApiMemory("m4"),
+    makeRecallApiMemory("m5"),
+  ];
+  let aiCalls = 0;
+  let filterPrompt = "";
+  globalThis.fetch = async () => new Response(JSON.stringify(rows), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+  try {
+    const selection = await productionMemoryInject.selectMemoriesForInjection(
+      {
+        SWEEPY_URL: "https://memory.test/aeliosmemory",
+        MEMORY_TOP_K: "12",
+        AI: {
+          run: async (_model, input) => {
+            aiCalls += 1;
+            if (aiCalls === 1) {
+              filterPrompt = input.messages[1].content;
+              return { memories: [
+                { id: "m1" },
+                { id: "m2" },
+                { id: "m3" },
+                { id: "m4" },
+                { id: "m5" },
+              ] };
+            }
+            return { memories: [
+              { id: "m1", content: "compressed m1" },
+              { id: "m2", content: "compressed m2" },
+              { id: "m3", content: "compressed m3" },
+              { id: "m4", content: "compressed m4" },
+            ] };
+          },
+        },
+      },
+      {
+        profile: { namespace: "default", injectionMode: "rag" },
+        query: "偏头痛又发作了",
+      }
+    );
+    assert.strictEqual(aiCalls, 2);
+    assert.ok(filterPrompt.includes("raw_similarity"));
+    assert.ok(filterPrompt.includes("recall_score"));
+    assert.strictEqual(selection.memories.length, 4);
+    assert.ok(selection.memories.every((memory) => memory.id !== "fixed"));
+    assert.deepStrictEqual(selection.commitMemoryIds, ["m1", "m4"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await checkAsync("injection commit sends one idempotent batch capped at 4", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  let requestedBody = null;
+  globalThis.fetch = async (url, init) => {
+    requestedUrl = String(url);
+    requestedBody = JSON.parse(init.body);
+    return new Response(JSON.stringify({
+      ok: true,
+      committed: true,
+      duplicate: false,
+      count: 4,
+      reactivated: 1,
+      protected: 0,
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    const result = await productionMemoryDb.commitMemoryInjection(
+      { SWEEPY_URL: "https://memory.test/aeliosmemory" },
+      { commitId: "msg_123", memoryIds: ["m1", "m2", "m3", "m4", "m5", "m1"] }
+    );
+    assert.ok(requestedUrl.endsWith("/api/memories/injection-commits"));
+    assert.deepStrictEqual(requestedBody, {
+      commit_id: "msg_123",
+      memory_ids: ["m1", "m2", "m3", "m4"],
+    });
+    assert.strictEqual(result.committed, true);
+    assert.strictEqual(result.count, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 // Cache placement, heartbeat truncation, and compression production code are

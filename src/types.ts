@@ -205,6 +205,17 @@ export interface MemoryRecord {
   created_at: string;
   updated_at: string;
   expires_at: string | null;
+  /** Lifecycle metadata returned by aeliosmemory. Optional during rolling deploys. */
+  archived?: boolean;
+  archived_at?: string | null;
+  last_injected_at?: string | null;
+  injection_count?: number;
+  retention_class?: "normal" | "permanent" | string;
+  retention_protected_at?: string | null;
+  /** Search-only ranking metadata. `score` remains the raw semantic similarity. */
+  raw_similarity?: number;
+  recall_score?: number;
+  effective_importance?: number;
 }
 
 export interface MemoryApiRecord {
@@ -226,7 +237,18 @@ export interface MemoryApiRecord {
   created_at: string;
   updated_at: string;
   expires_at: string | null;
+  archived?: boolean;
+  archived_at?: string | null;
+  last_injected_at?: string | null;
+  injection_count?: number;
+  retention_class?: "normal" | "permanent" | string;
+  retention_protected_at?: string | null;
+  /** Backward-compatible raw semantic similarity. */
   score?: number;
+  raw_similarity?: number;
+  /** Time/importance-aware score used only to order recall candidates. */
+  recall_score?: number;
+  effective_importance?: number;
 }
 
 export interface SummaryRecord {

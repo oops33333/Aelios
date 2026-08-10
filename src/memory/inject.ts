@@ -9,8 +9,19 @@
 
 import { listMemories } from "../db/memories";
 import type { Env, InjectionMode, KeyProfile, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest } from "../types";
-import { filterAndCompressMemories } from "./filter";
+import { formatMemoryPromptLine } from "../utils/memoryPrompt";
+import { filterAndCompressMemoriesWithMeta } from "./filter";
 import { searchMemories, toMemoryApiRecord } from "./search";
+
+const MAX_DYNAMIC_PROMPT_MEMORIES = 4;
+const FIXED_PERSONA_TYPES = new Set(["identity", "persona"]);
+
+export interface MemoryInjectionSelection {
+  /** Final dynamic memories that are actually eligible to enter the prompt. */
+  memories: MemoryApiRecord[];
+  /** Model-selected, countable dynamic IDs to commit only after upstream accepts the prompt. */
+  commitMemoryIds: string[];
+}
 
 function contentToText(content: OpenAIChatMessage["content"]): string {
   if (typeof content === "string") return content;
@@ -56,6 +67,7 @@ async function searchMemoriesForInjection(
       namespace: input.namespace,
       query: input.query,
       topK: input.topK,
+      purpose: "recall",
     });
   } catch (error) {
     console.error("memory injection search failed", error);
@@ -106,12 +118,43 @@ function sanitizeMemoryContent(text: string): string {
     .trim();
 }
 
+function isFixedPersonaMemory(memory: MemoryApiRecord): boolean {
+  return memory.pinned && FIXED_PERSONA_TYPES.has(memory.type);
+}
+
+function isCountableDynamicMemory(memory: MemoryApiRecord): boolean {
+  return !memory.pinned && !FIXED_PERSONA_TYPES.has(memory.type);
+}
+
+async function filterForInjection(
+  env: Env,
+  input: { query: string; memories: MemoryApiRecord[] }
+): Promise<MemoryInjectionSelection> {
+  // Pinned persona/identity records are injected by the stable block. Keeping
+  // them out of the dynamic stage prevents duplicate prompt lines and counting.
+  const candidates = input.memories.filter((memory) => !isFixedPersonaMemory(memory));
+  const result = await filterAndCompressMemoriesWithMeta(env, {
+    query: input.query,
+    memories: candidates,
+  });
+  const memories = result.data.slice(0, MAX_DYNAMIC_PROMPT_MEMORIES);
+  const modelSelected =
+    result.meta.filter_status === "success" || result.meta.compression_status === "success";
+
+  return {
+    memories,
+    commitMemoryIds: modelSelected
+      ? memories.filter(isCountableDynamicMemory).map((memory) => memory.id)
+      : [],
+  };
+}
+
 export async function selectMemoriesForInjection(
   env: Env,
   input: { profile: KeyProfile; query: string }
-): Promise<MemoryApiRecord[]> {
+): Promise<MemoryInjectionSelection> {
   const mode = resolveInjectionMode(input.profile, env);
-  if (mode === "none") return [];
+  if (mode === "none") return { memories: [], commitMemoryIds: [] };
 
   const namespace = input.profile.namespace;
 
@@ -121,7 +164,7 @@ export async function selectMemoriesForInjection(
       limit: 500,
     });
 
-    return filterAndCompressMemories(env, {
+    return filterForInjection(env, {
       query: input.query,
       memories,
     });
@@ -136,7 +179,7 @@ export async function selectMemoriesForInjection(
     : [];
 
   if (mode === "rag") {
-    return filterAndCompressMemories(env, {
+    return filterForInjection(env, {
       query: input.query,
       memories: ragMemories,
     });
@@ -148,7 +191,7 @@ export async function selectMemoriesForInjection(
   });
   const pinned = records.filter((record) => record.pinned);
 
-  return filterAndCompressMemories(env, {
+  return filterForInjection(env, {
     query: input.query,
     memories: dedupeMemories([...pinned, ...ragMemories]),
   });
@@ -189,9 +232,7 @@ export function formatMemoryPatch(memories: MemoryApiRecord[]): string {
   const lines = memories.flatMap((memory) => {
     const content = sanitizeMemoryContent(memory.content);
     if (!content) return [];
-    const importance = memory.importance.toFixed(2);
-    const pinned = memory.pinned ? "[pinned]" : "";
-    return [`- [${memory.type}][importance=${importance}]${pinned} ${content}`];
+    return [formatMemoryPromptLine({ ...memory, content }, { includePinned: true })];
   });
 
   if (lines.length === 0) return "";
@@ -199,6 +240,7 @@ export function formatMemoryPatch(memories: MemoryApiRecord[]): string {
   return [
     "以下是你自然记得的长期记忆。只有在相关时使用，不要机械复述。",
     '不要说\u201C根据记忆库\u201D\u201C系统记录\u201D或暴露任何代理层实现。',
+    "记忆末尾的“记录于”表示入库日期；较早记录只作历史背景，不代表当前状态，以当前对话为准。",
     "",
     "<memories>",
     ...lines,

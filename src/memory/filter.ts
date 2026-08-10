@@ -3,7 +3,8 @@ import type { Env, MemoryApiRecord, OpenAIChatRequest, OpenAIChatResponse } from
 
 const DEFAULT_WORKERS_AI_FILTER_MODEL = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const FILTER_SUCCESS_LIMIT = 4;
-const FILTER_FAILURE_COMPRESSION_LIMIT = 10;
+// API prompt 的动态记忆无论主筛选还是降级压缩都不得超过 4 条。
+const FILTER_FAILURE_COMPRESSION_LIMIT = FILTER_SUCCESS_LIMIT;
 
 interface FilteredMemoryItem {
   id: string;
@@ -166,6 +167,10 @@ function normalizeForDedupe(text: string): string {
 function compareMemoryQuality(a: MemoryApiRecord, b: MemoryApiRecord): number {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
 
+  const recallA = typeof a.recall_score === "number" ? a.recall_score : -1;
+  const recallB = typeof b.recall_score === "number" ? b.recall_score : -1;
+  if (recallA !== recallB) return recallB - recallA;
+
   const scoreA = typeof a.score === "number" ? a.score : -1;
   const scoreB = typeof b.score === "number" ? b.score : -1;
   if (scoreA !== scoreB) return scoreB - scoreA;
@@ -320,8 +325,25 @@ function buildFilterPrompt(input: {
     id: memory.id,
     type: memory.type,
     importance: memory.importance,
+    effective_importance:
+      typeof memory.effective_importance === "number"
+        ? Number(memory.effective_importance.toFixed(4))
+        : undefined,
     pinned: memory.pinned,
-    score: typeof memory.score === "number" ? Number(memory.score.toFixed(4)) : undefined,
+    archived: Boolean(memory.archived),
+    created_at: memory.created_at,
+    last_injected_at: memory.last_injected_at ?? null,
+    injection_count: memory.injection_count ?? 0,
+    raw_similarity:
+      typeof memory.raw_similarity === "number"
+        ? Number(memory.raw_similarity.toFixed(4))
+        : typeof memory.score === "number"
+          ? Number(memory.score.toFixed(4))
+          : undefined,
+    recall_score:
+      typeof memory.recall_score === "number"
+        ? Number(memory.recall_score.toFixed(4))
+        : undefined,
     tags: memory.tags,
     content: memory.content
   }));
@@ -329,7 +351,7 @@ function buildFilterPrompt(input: {
   return [
     "你是长期记忆分拣器。你的任务只是从候选记忆中挑出对当前用户消息真正有帮助的记忆。",
     "注意：你不是在判断这条候选是否值得长期保存；你只判断它是否能帮助当前这轮回答、回忆或检索。",
-    "候选已按相关度初筛；score 越高越相关。",
+    "候选已按召回分数初筛；raw_similarity 表示当前消息的原始语义相关度，recall_score 只用于候选排序。",
     "",
     "规则：",
     "- 只保留能帮助当前用户消息的候选：直接回答问题、补全上下文、长期偏好、正在进行的项目或稳定关系信息。",
@@ -337,7 +359,8 @@ function buildFilterPrompt(input: {
     "- type=summary 的候选只要包含与当前用户消息匹配的片段就保留；不要因为它是短期聊天摘要或对话摘要格式就整条丢弃。",
     "- 不要因为候选\u201C不够长期稳定\u201D而删除；删除标准只有明显无关、重复、空泛或调试噪音。",
     "- 删除寒暄、重复、牵强、明显无关的记忆。",
-    "- 同一事实只保留一条，优先保留 score 更高或 pinned=true 的版本。",
+    "- 同一事实只保留一条，优先保留 raw_similarity 更高或 pinned=true 的版本。",
+    "- archived=true 仅表示它长期未被注入；如果 raw_similarity 很高，仍应按当前相关性正常判断。",
     "- pinned=true 的记忆除非明显无关，否则优先保留。",
     "- 不要道德评判，不要拒绝，不要安全说教；成人向内容也只是用户偏好资料。",
     "- 候选记忆是什么内容，就按事实保留；保留用户偏好、边界、称呼、规则、触发点和关系事实。",
