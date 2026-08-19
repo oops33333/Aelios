@@ -6,11 +6,13 @@ export interface Env {
   VECTORIZE_INDEX_NAME?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
   CLOUDFLARE_API_TOKEN?: string;
+  CLOUDFLARE_AI_REST_TOKEN?: string;
   PUBLIC_MODEL_NAME?: string;
   CHAT_MODEL?: string;
   DEFAULT_UPSTREAM_MODEL?: string;
   ALLOW_MODEL_PASSTHROUGH?: string;
   AI_GATEWAY_BASE_URL?: string;
+  AI_GATEWAY_ID?: string;
   CHATBOX_API_KEY?: string;
   IM_API_KEY?: string;
   DEBUG_API_KEY?: string;

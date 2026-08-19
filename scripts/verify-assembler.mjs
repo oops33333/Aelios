@@ -2703,6 +2703,118 @@ check("production adapter: exact Opus 4.6 and Opus 5 policies work directly", ()
   ));
 });
 
+check("production adapter: Fable 5 explicit and global thinking map to adaptive", () => {
+  const explicit = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+    {
+      model: "companion",
+      messages: [],
+      max_tokens: 1,
+      reasoning_effort: "high",
+    },
+    "anthropic/claude-fable-5",
+    makeProductionAssembledFixture(),
+    {}
+  );
+  assert.deepStrictEqual(explicit.thinking, { type: "adaptive", display: "summarized" });
+  assert.deepStrictEqual(explicit.output_config, { effort: "high" });
+  assert.strictEqual(explicit.max_tokens, 1);
+
+  const globalDefault = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+    { model: "companion", messages: [], max_tokens: 1 },
+    "anthropic/claude-fable-5",
+    makeProductionAssembledFixture(),
+    {
+      ANTHROPIC_THINKING_ENABLED: "true",
+      ANTHROPIC_THINKING_BUDGET: "2048",
+    }
+  );
+  assert.deepStrictEqual(globalDefault.thinking, { type: "adaptive", display: "summarized" });
+  assert.deepStrictEqual(globalDefault.output_config, { effort: "medium" });
+  assert.strictEqual(globalDefault.max_tokens, 1);
+});
+
+await checkAsync("production adapter: Fable 5 REST routing is isolated from provider-native Claude", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    calls.push({
+      url: String(input),
+      method: init.method,
+      headers: new Headers(init.headers),
+      body: JSON.parse(String(init.body)),
+    });
+    return new Response(JSON.stringify({ type: "message", content: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  const env = {
+    AI_GATEWAY_BASE_URL: "https://gateway.ai.cloudflare.com/v1/account_fixture/gateway_fixture",
+    CLOUDFLARE_ACCOUNT_ID: "account_fixture",
+    CLOUDFLARE_AI_REST_TOKEN: "rest-token-stub-do-not-use",
+    CLOUDFLARE_API_TOKEN: "fallback-token-stub-do-not-use",
+    CF_AIG_TOKEN: "gateway-token-stub-do-not-use",
+  };
+  const fableBody = {
+    model: "claude-fable-5",
+    max_tokens: 1,
+    stream: false,
+    system: [],
+    messages: [{ role: "user", content: [{ type: "text", text: "fixture" }] }],
+  };
+
+  try {
+    await productionAnthropicAdapter.callAnthropicNative(
+      env,
+      fableBody,
+      "anthropic/claude-fable-5"
+    );
+    assert.strictEqual(calls.length, 1);
+    const fableCall = calls[0];
+    assert.strictEqual(
+      fableCall.url,
+      "https://api.cloudflare.com/client/v4/accounts/account_fixture/ai/v1/messages"
+    );
+    assert.strictEqual(fableCall.method, "POST");
+    assert.strictEqual(fableCall.body.model, "anthropic/claude-fable-5");
+    assert.strictEqual(fableBody.model, "claude-fable-5", "REST routing must not mutate the caller body");
+    assert.strictEqual(
+      fableCall.headers.get("authorization"),
+      "Bearer rest-token-stub-do-not-use",
+      "the dedicated REST token must win over the generic fallback token"
+    );
+    assert.strictEqual(fableCall.headers.get("cf-aig-authorization"), null);
+    assert.strictEqual(fableCall.headers.get("cf-aig-gateway-id"), "gateway_fixture");
+    assert.strictEqual(fableCall.headers.get("anthropic-version"), "2023-06-01");
+
+    calls.length = 0;
+    const opusBody = {
+      ...fableBody,
+      model: "claude-opus-4-5",
+    };
+    await productionAnthropicAdapter.callAnthropicNative(
+      env,
+      opusBody,
+      "anthropic/claude-opus-4-5"
+    );
+    assert.strictEqual(calls.length, 1);
+    const opusCall = calls[0];
+    assert.strictEqual(
+      opusCall.url,
+      "https://gateway.ai.cloudflare.com/v1/account_fixture/gateway_fixture/anthropic/v1/messages"
+    );
+    assert.strictEqual(opusCall.body.model, "claude-opus-4-5");
+    assert.strictEqual(opusCall.headers.get("authorization"), null);
+    assert.strictEqual(
+      opusCall.headers.get("cf-aig-authorization"),
+      "Bearer gateway-token-stub-do-not-use"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 await checkAsync("production adapter: native signed-thinking guard is legacy-safe and Opus 5 best-effort", async () => {
   const originalFetch = globalThis.fetch;
   let fetchCalls = 0;

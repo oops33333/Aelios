@@ -299,6 +299,11 @@ function isOpus5(model: string): boolean {
   return /^claude-opus-5(?:$|-[a-z0-9]+(?:-[a-z0-9]+)*)$/.test(getCanonicalAnthropicModel(model));
 }
 
+function isFable5(model: string): boolean {
+  const canonical = stripAnthropicProviderPrefix(model).trim().toLowerCase();
+  return /^claude-fable-5(?:$|-[a-z0-9]+(?:-[a-z0-9]+)*)$/.test(canonical);
+}
+
 function supportsAdaptiveThinking(model: string): boolean {
   const canonical = getCanonicalAnthropicModel(model);
   return /^claude-(?:opus|sonnet)-4-6(?:$|-)/.test(canonical) && !isCanonicalOpus46(model);
@@ -560,6 +565,29 @@ function buildThinkingConfig(
   targetModel: string
 ): ThinkingConfig {
   const requestDirective = getRequestThinkingDirective(req);
+  // Fable 5 always uses adaptive thinking. Omitting the field is valid and
+  // preserves the model default; explicit/enabled legacy budgets are mapped
+  // to adaptive effort instead of sending the unsupported `type: enabled`.
+  if (isFable5(targetModel)) {
+    if (env.ANTHROPIC_THINKING_ENABLED === "false" || requestDirective.enabled === false) {
+      return {};
+    }
+
+    const explicitlyEnabled =
+      requestDirective.enabled === true ||
+      requestDirective.budget !== undefined ||
+      env.ANTHROPIC_THINKING_ENABLED === "true";
+    if (!explicitlyEnabled) return {};
+
+    const budget = requestDirective.budget ?? getEnvThinkingBudget(env);
+    return {
+      thinking: { type: "adaptive", display: "summarized" },
+      outputConfig: {
+        effort: requestDirective.effort ?? effortFromThinkingBudget(budget)
+      }
+    };
+  }
+
   if (isOpus5(targetModel)) {
     if (env.ANTHROPIC_THINKING_ENABLED === "false" || requestDirective.enabled === false) {
       return { thinking: { type: "disabled" } };
@@ -765,6 +793,62 @@ export function buildAnthropicHeaders(env: Env): Headers {
   return headers;
 }
 
+function getCloudflareAiRestToken(env: Env): string {
+  const token = env.CLOUDFLARE_AI_REST_TOKEN?.trim() || env.CLOUDFLARE_API_TOKEN?.trim();
+  if (!token) {
+    throw new Error(
+      "Missing Cloudflare REST API token: set CLOUDFLARE_AI_REST_TOKEN or CLOUDFLARE_API_TOKEN"
+    );
+  }
+  return token;
+}
+
+function getCloudflareAiRestMessagesUrl(env: Env): string {
+  const accountId = env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  if (!accountId) {
+    throw new Error("Missing CLOUDFLARE_ACCOUNT_ID for Claude Fable 5");
+  }
+  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/v1/messages`;
+}
+
+function getAiGatewayId(env: Env): string {
+  const configured = env.AI_GATEWAY_ID?.trim();
+  if (configured) return configured;
+
+  const base = normalizeAiGatewayBaseUrl(env);
+  if (base) {
+    try {
+      const segments = new URL(base).pathname.split("/").filter(Boolean);
+      const v1Index = segments.indexOf("v1");
+      const gatewayId = v1Index >= 0 ? segments[v1Index + 2] : undefined;
+      if (gatewayId) return decodeURIComponent(gatewayId);
+    } catch {
+      // Fall through to Cloudflare's default gateway.
+    }
+  }
+  return "default";
+}
+
+function buildCloudflareAiRestHeaders(env: Env): Headers {
+  const headers = buildAnthropicHeaders(env);
+  headers.delete("cf-aig-authorization");
+  headers.set("authorization", `Bearer ${getCloudflareAiRestToken(env)}`);
+  headers.set("cf-aig-gateway-id", getAiGatewayId(env));
+  return headers;
+}
+
+async function callFable5ViaCloudflareRest(env: Env, body: AnthropicRequest): Promise<Response> {
+  const restBody: AnthropicRequest = {
+    ...body,
+    model: `anthropic/${stripAnthropicModelPrefix(body.model)}`
+  };
+  return fetch(getCloudflareAiRestMessagesUrl(env), {
+    method: "POST",
+    headers: buildCloudflareAiRestHeaders(env),
+    body: JSON.stringify(restBody)
+  });
+}
+
 export async function buildAnthropicNativeRequest(
   req: OpenAIChatRequest,
   input: {
@@ -918,7 +1002,12 @@ function applyCacheOverrides(systemBlocks: AnthropicTextBlock[], env: Env): void
 }
 
 export async function callAnthropicNative(env: Env, body: AnthropicRequest, targetModel?: string): Promise<Response> {
-  return fetch(getAnthropicUrlForModel(env, targetModel || body.model), {
+  const model = targetModel || body.model;
+  if (isFable5(model)) {
+    return callFable5ViaCloudflareRest(env, body);
+  }
+
+  return fetch(getAnthropicUrlForModel(env, model), {
     method: "POST",
     headers: buildAnthropicHeaders(env),
     body: JSON.stringify(body)
