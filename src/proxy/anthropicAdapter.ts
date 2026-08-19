@@ -5,6 +5,7 @@ import { formatVolatileContext, splitClientSystem } from "../assembler/blocks";
 import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatResponse, TokenUsage } from "../types";
 import { formatMemoryPatch, formatRemindersBlock } from "../memory/inject";
 import { normalizeAiGatewayBaseUrl } from "./openaiAdapter";
+import { isFable5Model } from "./resolveModel";
 import { getStashedThinking } from "./thinkingStash";
 import {
   convertToolMessageToAnthropicToolResult,
@@ -89,6 +90,11 @@ export interface AnthropicRequest {
   system: AnthropicTextBlock[];
   messages: AnthropicMessage[];
 }
+
+type CloudflareFableRestRequest = Omit<AnthropicRequest, "model" | "system"> & {
+  model: string;
+  system?: string;
+};
 
 interface AnthropicResponse {
   id?: string;
@@ -297,11 +303,6 @@ function isCanonicalOpus46(model: string): boolean {
 
 function isOpus5(model: string): boolean {
   return /^claude-opus-5(?:$|-[a-z0-9]+(?:-[a-z0-9]+)*)$/.test(getCanonicalAnthropicModel(model));
-}
-
-function isFable5(model: string): boolean {
-  const canonical = stripAnthropicProviderPrefix(model).trim().toLowerCase();
-  return /^claude-fable-5(?:$|-[a-z0-9]+(?:-[a-z0-9]+)*)$/.test(canonical);
 }
 
 function supportsAdaptiveThinking(model: string): boolean {
@@ -568,7 +569,7 @@ function buildThinkingConfig(
   // Fable 5 always uses adaptive thinking. Omitting the field is valid and
   // preserves the model default; explicit/enabled legacy budgets are mapped
   // to adaptive effort instead of sending the unsupported `type: enabled`.
-  if (isFable5(targetModel)) {
+  if (isFable5Model(targetModel)) {
     if (env.ANTHROPIC_THINKING_ENABLED === "false" || requestDirective.enabled === false) {
       return {};
     }
@@ -838,9 +839,15 @@ function buildCloudflareAiRestHeaders(env: Env): Headers {
 }
 
 async function callFable5ViaCloudflareRest(env: Env, body: AnthropicRequest): Promise<Response> {
-  const restBody: AnthropicRequest = {
-    ...body,
-    model: `anthropic/${stripAnthropicModelPrefix(body.model)}`
+  const { system: systemBlocks, ...rest } = body;
+  const system = systemBlocks
+    .map((block) => block.text)
+    .filter((text) => text.length > 0)
+    .join("\n\n");
+  const restBody: CloudflareFableRestRequest = {
+    ...rest,
+    model: `anthropic/${stripAnthropicModelPrefix(body.model)}`,
+    ...(system ? { system } : {})
   };
   return fetch(getCloudflareAiRestMessagesUrl(env), {
     method: "POST",
@@ -1003,7 +1010,7 @@ function applyCacheOverrides(systemBlocks: AnthropicTextBlock[], env: Env): void
 
 export async function callAnthropicNative(env: Env, body: AnthropicRequest, targetModel?: string): Promise<Response> {
   const model = targetModel || body.model;
-  if (isFable5(model)) {
+  if (isFable5Model(model)) {
     return callFable5ViaCloudflareRest(env, body);
   }
 

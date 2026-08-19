@@ -62,14 +62,18 @@ async function importBundledProductionModule(relativePath) {
 }
 
 const [
+  productionChatCompletions,
   productionAnthropicAdapter,
+  productionResolveModel,
   productionHeartbeatPrefix,
   productionMemoryPrompt,
   productionMemoryInject,
   productionMemoryDb,
   productionMemoryRetention,
 ] = await Promise.all([
+  importBundledProductionModule("../src/api/chatCompletions.ts"),
   importBundledProductionModule("../src/proxy/anthropicAdapter.ts"),
+  importBundledProductionModule("../src/proxy/resolveModel.ts"),
   importBundledProductionModule("../src/proxy/heartbeatPrefix.ts"),
   importBundledProductionModule("../src/utils/memoryPrompt.ts"),
   importBundledProductionModule("../src/memory/inject.ts"),
@@ -2733,6 +2737,118 @@ check("production adapter: Fable 5 explicit and global thinking map to adaptive"
   assert.strictEqual(globalDefault.max_tokens, 1);
 });
 
+await checkAsync("production chat: only resolved Fable 5 targets bypass history compression", async () => {
+  const messages = Array.from({ length: 31 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `message-${index}`,
+  }));
+  const throwingDb = {
+    prepare() {
+      throw new Error("Fable compression bypass must not touch D1");
+    },
+  };
+  const fableEnv = { ENABLE_HISTORY_COMPRESSION: "true", DB: throwingDb };
+
+  for (const target of [
+    "claude-fable-5",
+    "anthropic/claude-fable-5",
+    "anthropic/claude-fable-5-20260819",
+  ]) {
+    const result = await productionChatCompletions.prepareHistoryForTargetModel(
+      fableEnv,
+      messages,
+      "test",
+      target
+    );
+    assert.strictEqual(result.summary, null);
+    assert.strictEqual(result.messages, messages);
+    assert.strictEqual(result.meta.original_count, 31);
+    assert.strictEqual(result.meta.compressed_count, 0);
+    assert.strictEqual(result.meta.kept_count, 31);
+  }
+
+  const resolvedAlias = productionResolveModel.resolveTargetModel(
+    "companion",
+    { allowModelPassthrough: false },
+    { PUBLIC_MODEL_NAME: "companion", CHAT_MODEL: "anthropic/claude-fable-5" }
+  );
+  assert.strictEqual(resolvedAlias, "anthropic/claude-fable-5");
+  const aliasResult = await productionChatCompletions.prepareHistoryForTargetModel(
+    fableEnv,
+    messages,
+    "test",
+    resolvedAlias
+  );
+  assert.strictEqual(aliasResult.summary, null);
+  assert.strictEqual(aliasResult.messages, messages);
+
+  let cacheReads = 0;
+  const cacheHitDb = {
+    prepare() {
+      return {
+        bind() {
+          return {
+            async first() {
+              cacheReads += 1;
+              return {
+                value_json: null,
+                value_text: "cached-opus-summary",
+                expires_at: null,
+              };
+            },
+          };
+        },
+      };
+    },
+  };
+  const opusResult = await productionChatCompletions.prepareHistoryForTargetModel(
+    { ENABLE_HISTORY_COMPRESSION: "true", DB: cacheHitDb },
+    messages,
+    "test",
+    "anthropic/claude-opus-4-5"
+  );
+  assert.ok(cacheReads > 0, "non-Fable models must still execute the compressor");
+  assert.strictEqual(opusResult.summary, "cached-opus-summary");
+  assert.strictEqual(opusResult.meta.compressed_count, 25);
+  assert.strictEqual(opusResult.messages.length, 6);
+
+  const ctx = makeBaseCtx();
+  ctx.historyMessages = aliasResult.messages.slice(0, -1);
+  ctx.currentUserMessage = aliasResult.messages.at(-1);
+  ctx.compressedSummary = aliasResult.summary;
+  ctx.reminders = ["保持既有提醒注入"];
+  const assembled = assemble(ctx);
+  assert.ok(!assembled.meta.block_ids.includes("compressed_summary"));
+  for (const id of [
+    "client_system",
+    "persona_pinned",
+    "long_term_summary",
+    "proxy_static_rules",
+    "preset_lite",
+    "dynamic_memory_patch",
+    "reminders",
+  ]) {
+    assert.ok(assembled.meta.block_ids.includes(id), `${id} must survive the Fable compression bypass`);
+  }
+
+  const request = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+    { model: "companion", messages },
+    resolvedAlias,
+    assembled,
+    { ANTHROPIC_CACHE_TTL: "1h" }
+  );
+  const systemText = request.system.map((block) => block.text).join("\n");
+  const messageText = request.messages
+    .flatMap((message) => message.content)
+    .map((block) => block.text || "")
+    .join("\n");
+  assert.match(systemText, /长期对话摘要/);
+  assert.ok(!systemText.includes("[以下是之前对话的压缩摘要]"));
+  assert.match(messageText, /<memories>/);
+  assert.match(messageText, /<reminders>/);
+  assert.match(messageText, /当前时间/);
+});
+
 await checkAsync("production adapter: Fable 5 REST routing is isolated from provider-native Claude", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -2759,10 +2875,27 @@ await checkAsync("production adapter: Fable 5 REST routing is isolated from prov
   const fableBody = {
     model: "claude-fable-5",
     max_tokens: 1,
+    temperature: 1,
     stream: false,
-    system: [],
-    messages: [{ role: "user", content: [{ type: "text", text: "fixture" }] }],
+    cache_control: { type: "ephemeral", ttl: "1h" },
+    thinking: { type: "adaptive", display: "summarized" },
+    output_config: { effort: "high" },
+    tools: [{ name: "fixture_tool", input_schema: { type: "object", properties: {} } }],
+    tool_choice: { type: "auto" },
+    system: [
+      { type: "text", text: "stable system", cache_control: { type: "ephemeral", ttl: "1h" } },
+      { type: "text", text: "" },
+      { type: "text", text: "long-term summary", cache_control: { type: "ephemeral", ttl: "1h" } },
+    ],
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: "cached", cache_control: { type: "ephemeral", ttl: "1h" } },
+        { type: "text", text: "volatile" },
+      ],
+    }],
   };
+  const originalFableBody = structuredClone(fableBody);
 
   try {
     await productionAnthropicAdapter.callAnthropicNative(
@@ -2778,7 +2911,11 @@ await checkAsync("production adapter: Fable 5 REST routing is isolated from prov
     );
     assert.strictEqual(fableCall.method, "POST");
     assert.strictEqual(fableCall.body.model, "anthropic/claude-fable-5");
-    assert.strictEqual(fableBody.model, "claude-fable-5", "REST routing must not mutate the caller body");
+    assert.strictEqual(fableCall.body.system, "stable system\n\nlong-term summary");
+    const { model: expectedModel, system: expectedSystem, ...expectedRest } = fableBody;
+    const { model: actualModel, system: actualSystem, ...actualRest } = fableCall.body;
+    assert.deepStrictEqual(actualRest, expectedRest, "non-system Fable fields must pass through unchanged");
+    assert.deepStrictEqual(fableBody, originalFableBody, "REST routing must not mutate the caller body");
     assert.strictEqual(
       fableCall.headers.get("authorization"),
       "Bearer rest-token-stub-do-not-use",
@@ -2787,6 +2924,15 @@ await checkAsync("production adapter: Fable 5 REST routing is isolated from prov
     assert.strictEqual(fableCall.headers.get("cf-aig-authorization"), null);
     assert.strictEqual(fableCall.headers.get("cf-aig-gateway-id"), "gateway_fixture");
     assert.strictEqual(fableCall.headers.get("anthropic-version"), "2023-06-01");
+
+    calls.length = 0;
+    await productionAnthropicAdapter.callAnthropicNative(
+      env,
+      { ...fableBody, system: [] },
+      "anthropic/claude-fable-5"
+    );
+    assert.strictEqual(calls.length, 1);
+    assert.ok(!Object.prototype.hasOwnProperty.call(calls[0].body, "system"));
 
     calls.length = 0;
     const opusBody = {
@@ -2805,6 +2951,7 @@ await checkAsync("production adapter: Fable 5 REST routing is isolated from prov
       "https://gateway.ai.cloudflare.com/v1/account_fixture/gateway_fixture/anthropic/v1/messages"
     );
     assert.strictEqual(opusCall.body.model, "claude-opus-4-5");
+    assert.deepStrictEqual(opusCall.body.system, fableBody.system);
     assert.strictEqual(opusCall.headers.get("authorization"), null);
     assert.strictEqual(
       opusCall.headers.get("cf-aig-authorization"),

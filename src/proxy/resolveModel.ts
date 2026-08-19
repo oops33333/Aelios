@@ -1,5 +1,10 @@
 import type { Env, KeyProfile } from "../types";
 
+export function isFable5Model(model: string): boolean {
+  const canonical = model.replace(/^anthropic\//i, "").trim().toLowerCase();
+  return /^claude-fable-5(?:$|-[a-z0-9]+(?:-[a-z0-9]+)*)$/.test(canonical);
+}
+
 export function resolveTargetModel(requestModel: string, profile: KeyProfile, env: Env): string {
   const publicModel = env.PUBLIC_MODEL_NAME || "companion";
   const defaultModel = env.CHAT_MODEL || env.DEFAULT_UPSTREAM_MODEL;

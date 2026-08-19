@@ -7,7 +7,7 @@ import { saveAssistantMessage, saveUserMessages } from "../db/messages";
 import { getLatestSummary } from "../db/summaries";
 import { saveUsageLog } from "../db/usageLogs";
 import { extractLastUserText, fetchSweepyReminders, injectMemoryPatchAsSystemMessage, selectMemoriesForInjection } from "../memory/inject";
-import { compressHistoryIfNeeded } from "../memory/compress";
+import { compressHistoryIfNeeded, type CompressResult } from "../memory/compress";
 import { toMemoryApiRecord } from "../memory/search";
 import { assemble } from "../assembler/assemble";
 import { PERSONA_MEMORY_TYPES } from "../assembler/types";
@@ -21,7 +21,7 @@ import {
 } from "../proxy/anthropicAdapter";
 import { loadHeartbeatBody, makeReplayable, storeHeartbeatBody } from "../proxy/heartbeatPrefix";
 import { buildOpenAICompatRequest, buildOpenAIRequestFromAssembled, callOpenAICompat } from "../proxy/openaiAdapter";
-import { classifyProvider, resolveTargetModel } from "../proxy/resolveModel";
+import { classifyProvider, isFable5Model, resolveTargetModel } from "../proxy/resolveModel";
 import { streamAnthropicToOpenAI } from "../proxy/streamAnthropic";
 import { stashThinkingSignature } from "../proxy/thinkingStash";
 import { streamOpenAIWithTee } from "../proxy/streamOpenAI";
@@ -48,6 +48,34 @@ export function hasToolContent(body: OpenAIChatRequest): boolean {
   return body.messages.some(
     (m) => m.role === "tool" || (m.role === "assistant" && m.tool_calls != null)
   );
+}
+
+export function prepareHistoryForTargetModel(
+  env: Env,
+  messages: OpenAIChatMessage[],
+  namespace: string,
+  targetModel: string
+): Promise<CompressResult> {
+  if (!isFable5Model(targetModel)) {
+    return compressHistoryIfNeeded(env, messages, namespace);
+  }
+
+  const chatMessageCount = messages.filter(
+    (message) => message.role === "user" || message.role === "assistant"
+  ).length;
+  return Promise.resolve({
+    summary: null,
+    messages,
+    meta: {
+      original_count: chatMessageCount,
+      compressed_count: 0,
+      kept_count: chatMessageCount,
+      cache_hit: false,
+      compress_boundary: 0,
+      total_segments: 0,
+      segments_computed: 0,
+    },
+  });
 }
 
 /**
@@ -278,7 +306,7 @@ export async function handleChatCompletions(
   const userQuery = extractLastUserText(body.messages);
   const memoryQuery = visionOutput ? `${userQuery}\n${visionOutput}`.slice(0, 500) : userQuery;
   const [compressResult, memorySelection, pinnedPersonaMemories, latestSummary, fetchedReminders] = await Promise.all([
-    compressHistoryIfNeeded(env, body.messages, auth.profile.namespace),
+    prepareHistoryForTargetModel(env, body.messages, auth.profile.namespace, targetModel),
     selectMemoriesForInjection(env, { profile: auth.profile, query: memoryQuery }),
     fetchPinnedPersonaMemories(env, auth.profile.namespace),
     getLatestSummary(env.DB, auth.profile.namespace),
