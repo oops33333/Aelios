@@ -566,9 +566,10 @@ function buildThinkingConfig(
   targetModel: string
 ): ThinkingConfig {
   const requestDirective = getRequestThinkingDirective(req);
-  // Fable 5 always uses adaptive thinking. Omitting the field is valid and
-  // preserves the model default; explicit/enabled legacy budgets are mapped
-  // to adaptive effort instead of sending the unsupported `type: enabled`.
+  // Fable 5 always uses adaptive thinking. Default requests opt into a visible
+  // summary without overriding the model's default effort; explicit/enabled
+  // legacy budgets are mapped to adaptive effort instead of sending the
+  // unsupported `type: enabled`.
   if (isFable5Model(targetModel)) {
     if (env.ANTHROPIC_THINKING_ENABLED === "false" || requestDirective.enabled === false) {
       return {};
@@ -578,7 +579,9 @@ function buildThinkingConfig(
       requestDirective.enabled === true ||
       requestDirective.budget !== undefined ||
       env.ANTHROPIC_THINKING_ENABLED === "true";
-    if (!explicitlyEnabled) return {};
+    if (!explicitlyEnabled) {
+      return { thinking: { type: "adaptive", display: "summarized" } };
+    }
 
     const budget = requestDirective.budget ?? getEnvThinkingBudget(env);
     return {

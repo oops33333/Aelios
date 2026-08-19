@@ -2707,7 +2707,17 @@ check("production adapter: exact Opus 4.6 and Opus 5 policies work directly", ()
   ));
 });
 
-check("production adapter: Fable 5 explicit and global thinking map to adaptive", () => {
+check("production adapter: Fable 5 defaults visible and preserves explicit controls", () => {
+  const defaultVisible = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+    { model: "companion", messages: [], max_tokens: 1 },
+    "anthropic/claude-fable-5",
+    makeProductionAssembledFixture(),
+    {}
+  );
+  assert.deepStrictEqual(defaultVisible.thinking, { type: "adaptive", display: "summarized" });
+  assert.strictEqual(defaultVisible.output_config, undefined);
+  assert.strictEqual(defaultVisible.max_tokens, 1);
+
   const explicit = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
     {
       model: "companion",
@@ -2735,6 +2745,36 @@ check("production adapter: Fable 5 explicit and global thinking map to adaptive"
   assert.deepStrictEqual(globalDefault.thinking, { type: "adaptive", display: "summarized" });
   assert.deepStrictEqual(globalDefault.output_config, { effort: "medium" });
   assert.strictEqual(globalDefault.max_tokens, 1);
+
+  for (const directive of [
+    { reasoning_effort: "none" },
+    { thinking: false },
+  ]) {
+    const explicitlyHidden = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+      { model: "companion", messages: [], max_tokens: 1, ...directive },
+      "anthropic/claude-fable-5",
+      makeProductionAssembledFixture(),
+      {}
+    );
+    assert.strictEqual(explicitlyHidden.thinking, undefined);
+    assert.strictEqual(explicitlyHidden.output_config, undefined);
+    assert.strictEqual(explicitlyHidden.max_tokens, 1);
+  }
+
+  const envHidden = productionAnthropicAdapter.buildAnthropicRequestFromAssembled(
+    {
+      model: "companion",
+      messages: [],
+      max_tokens: 1,
+      reasoning_effort: "high",
+    },
+    "anthropic/claude-fable-5",
+    makeProductionAssembledFixture(),
+    { ANTHROPIC_THINKING_ENABLED: "false" }
+  );
+  assert.strictEqual(envHidden.thinking, undefined);
+  assert.strictEqual(envHidden.output_config, undefined);
+  assert.strictEqual(envHidden.max_tokens, 1);
 });
 
 await checkAsync("production chat: only resolved Fable 5 targets bypass history compression", async () => {
