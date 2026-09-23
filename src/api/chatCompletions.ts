@@ -3,7 +3,7 @@ import { requireScope } from "../auth/scopes";
 import { getOrCreateConversation } from "../db/conversations";
 import { finishIdempotentTask, tryStartIdempotentTask } from "../db/idempotency";
 import { commitMemoryInjection, listMemories } from "../db/memories";
-import { saveAssistantMessage, saveUserMessages } from "../db/messages";
+import { findUserMessageForContinuation, isNewUserRequest, saveAssistantMessage, saveUserMessages } from "../db/messages";
 import { getLatestSummary } from "../db/summaries";
 import { saveUsageLog } from "../db/usageLogs";
 import { extractLastUserText, fetchSweepyReminders, injectMemoryPatchAsSystemMessage, selectMemoriesForInjection } from "../memory/inject";
@@ -29,6 +29,7 @@ import { CONTENT_RULES } from "../preset/regexRules";
 import { applyRegexRules } from "../preset/regexPipeline";
 import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { openAiError } from "../utils/json";
+import { newId } from "../utils/ids";
 import {
   getLastUserVisionImageParts,
   hasNonToolVisionImageContent,
@@ -48,6 +49,83 @@ export function hasToolContent(body: OpenAIChatRequest): boolean {
   return body.messages.some(
     (m) => m.role === "tool" || (m.role === "assistant" && m.tool_calls != null)
   );
+}
+
+export async function getMessageGapReminder(
+  db: D1Database,
+  namespace: string,
+  messages: OpenAIChatMessage[],
+  isHeartbeat: boolean,
+  now: number
+): Promise<string | null> {
+  if (isHeartbeat || !isNewUserRequest(messages)) return null;
+
+  try {
+    const previous = await db.prepare(
+      `SELECT created_at FROM messages
+       WHERE namespace = ? AND role = 'user'
+       ORDER BY created_at DESC LIMIT 1`
+    ).bind(namespace).first<{ created_at: string }>();
+    if (!previous) return null;
+    const elapsed = now - Date.parse(previous.created_at);
+    if (!Number.isFinite(elapsed) || elapsed <= 30 * 60_000) return null;
+    const minutes = Math.floor(elapsed / 60_000);
+    return elapsed > 2 * 60 * 60_000
+      ? `距用户上次发来消息已过去约 ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟，好久没来找你了。`
+      : `距用户上次发来消息已过去约 ${minutes} 分钟，有段时间没来找你了。`;
+  } catch {
+    // 提醒查询失败不阻断聊天，也不输出数据库错误中的潜在消息内容。
+    console.warn("message gap reminder lookup failed");
+    return null;
+  }
+}
+
+/** 只修改最终上游请求，在已有缓存锚点和动态内容之后追加，不污染客户端 body。 */
+export function appendMessageGapReminder(
+  request: { messages: Array<{ role: string; content: string | unknown[] | null }> },
+  reminder: string | null
+): void {
+  if (!reminder) return;
+  const lastIndex = request.messages.length - 1;
+  const last = request.messages[lastIndex];
+  if (last?.role !== "user") {
+    request.messages = [...request.messages, { role: "user", content: [{ type: "text", text: reminder }] }];
+    return;
+  }
+  request.messages = request.messages.map((message, index) => index !== lastIndex ? message : {
+    ...message,
+    content: Array.isArray(message.content)
+      ? [...message.content, { type: "text", text: reminder }]
+      : `${message.content ?? ""}\n\n${reminder}`,
+  });
+}
+
+export function buildVisionDescriptionRequest(
+  model: string,
+  userImageParts: Record<string, unknown>[]
+): OpenAIChatRequest {
+  return {
+    model,
+    messages: [
+      { role: "system", content: "你是图片描述工具。如实、详细地描述图片中看到的所有内容：物体、人物、场景、文字、颜色、布局。只输出描述本身，不要加任何分析、解读、评论或开场白。" },
+      { role: "user", content: [{ type: "text", text: "请描述这张图片。" }, ...userImageParts] },
+    ],
+    max_tokens: 500,
+    reasoning: { enabled: false },
+    enable_thinking: false,
+    stream: false,
+  };
+}
+
+export function extractVisionDescription(response: OpenAIChatResponse): string | null {
+  const content = response.choices?.[0]?.message?.content;
+  if (typeof content !== "string") return null;
+
+  // 读图描述会进入用户上下文和记忆检索；遇到未闭合思考标签时也按失败关闭。
+  const description = content
+    .replace(/<(thinking|think)>[\s\S]*?(?:<\/\1>|$)|<\/?(?:thinking|think)>/gi, "")
+    .trim();
+  return description || null;
 }
 
 export function prepareHistoryForTargetModel(
@@ -203,6 +281,7 @@ export async function handleChatCompletions(
   }
 
   const isHeartbeat = request.headers.get("x-heartbeat") === "true";
+  const requestReceivedAt = Date.now();
 
   if (isHeartbeat) {
     // 心跳不落库也不该走流式；防止下游 conversation!.id 空指针
@@ -240,18 +319,13 @@ export async function handleChatCompletions(
   if (hasNonToolVisionImageContent(body) && env.VISION_MODEL) {
     if (userImageParts.length > 0) {
       try {
-        const visionRes = await callOpenAICompat(env, {
-          model: env.VISION_MODEL,
-          messages: [
-            { role: "system", content: "你是图片描述工具。如实、详细地描述图片中看到的所有内容：物体、人物、场景、文字、颜色、布局。只输出描述本身，不要加任何分析、解读、评论或开场白。" },
-            { role: "user", content: [{ type: "text", text: "请描述这张图片。" }, ...userImageParts] },
-          ],
-          max_tokens: 500,
-          stream: false,
-        } as OpenAIChatRequest);
+        const visionRes = await callOpenAICompat(
+          env,
+          buildVisionDescriptionRequest(env.VISION_MODEL, userImageParts)
+        );
         if (visionRes.ok) {
-          const vd = await visionRes.json() as { choices?: Array<{ message?: { content?: string } }> };
-          visionOutput = vd?.choices?.[0]?.message?.content || null;
+          const vd = await visionRes.json() as OpenAIChatResponse;
+          visionOutput = extractVisionDescription(vd);
           console.log("[vision] output:", visionOutput ? visionOutput.slice(0, 80) + "..." : "empty");
         } else {
           console.log("[vision] error status:", visionRes.status, await visionRes.text().catch(() => ""));
@@ -288,18 +362,36 @@ export async function handleChatCompletions(
   });
 
   let latestUserMessageId: string | undefined;
+  let memoryCommitId: string | undefined;
+  // 必须在本次用户消息落库前读取；以请求收到时间计算，避免读图耗时改变间隔。
+  const messageGapReminder = await getMessageGapReminder(
+    env.DB, auth.profile.namespace, body.messages, isHeartbeat, requestReceivedAt
+  );
   if (!isHeartbeat) {
-    const savedUserMessageIds = await saveUserMessages(env.DB, {
-      conversationId: conversation!.id,
-      namespace: auth.profile.namespace,
-      source: auth.profile.source,
-      messages: body.messages,
-      requestModel: body.model,
-      upstreamModel: targetModel,
-      upstreamProvider: provider,
-      stream: Boolean(body.stream)
-    });
-    latestUserMessageId = savedUserMessageIds[savedUserMessageIds.length - 1];
+    if (isNewUserRequest(body.messages)) {
+      const savedUserMessageIds = await saveUserMessages(env.DB, {
+        conversationId: conversation!.id,
+        namespace: auth.profile.namespace,
+        source: auth.profile.source,
+        messages: body.messages,
+        requestModel: body.model,
+        upstreamModel: targetModel,
+        upstreamProvider: provider,
+        stream: Boolean(body.stream)
+      });
+      latestUserMessageId = savedUserMessageIds[savedUserMessageIds.length - 1];
+      memoryCommitId = latestUserMessageId;
+    } else {
+      latestUserMessageId = await findUserMessageForContinuation(env.DB, {
+        conversationId: conversation!.id,
+        namespace: auth.profile.namespace,
+        messages: body.messages,
+      });
+      // 工具续答不新增用户行，但每次成功上游请求仍独立计记忆活跃。
+      if (body.messages.some((message) => message.role === "user")) {
+        memoryCommitId = newId("memory_injection");
+      }
+    }
   }
 
   // History compression + memory search + persona + summary in parallel
@@ -346,6 +438,7 @@ export async function handleChatCompletions(
           memories,
           reminders
         });
+        appendMessageGapReminder(anthropicRequest, messageGapReminder);
         upstream = await callAnthropicNative(
           env,
           isHeartbeat ? makeReplayable(anthropicRequest) : anthropicRequest,
@@ -367,6 +460,7 @@ export async function handleChatCompletions(
         // as a temporary fallback; native Anthropic image support will be added
         // when the vision pipeline is wired in.
         const anthropicRequest = buildAnthropicRequestFromAssembled(body, targetModel, assembled, env);
+        appendMessageGapReminder(anthropicRequest, messageGapReminder);
         upstream = await callAnthropicNative(
           env,
           isHeartbeat ? makeReplayable(anthropicRequest) : anthropicRequest,
@@ -387,6 +481,7 @@ export async function handleChatCompletions(
           reminders
         );
         const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel);
+        appendMessageGapReminder(upstreamRequest, messageGapReminder);
         upstream = await callOpenAICompat(env, upstreamRequest);
       } else {
         const assembled = assemble({
@@ -399,7 +494,9 @@ export async function handleChatCompletions(
           compressedSummary,
         });
         clientSystemHash = assembled.meta.client_system_hash;
-        upstream = await callOpenAICompat(env, buildOpenAIRequestFromAssembled(body, targetModel, assembled));
+        const upstreamRequest = buildOpenAIRequestFromAssembled(body, targetModel, assembled);
+        appendMessageGapReminder(upstreamRequest, messageGapReminder);
+        upstream = await callOpenAICompat(env, upstreamRequest);
       }
     }
   } catch (error) {
@@ -419,10 +516,10 @@ export async function handleChatCompletions(
 
   // 只有成功送达上游 prompt 的最终动态记忆才计活跃。候选搜索、静态
   // pinned/persona、filter disabled 和 heartbeat 都不会进入 commitMemoryIds。
-  if (!isHeartbeat && latestUserMessageId && memorySelection.commitMemoryIds.length > 0) {
+  if (!isHeartbeat && memoryCommitId && memorySelection.commitMemoryIds.length > 0) {
     ctx.waitUntil(
       commitMemoryInjection(env, {
-        commitId: latestUserMessageId,
+        commitId: memoryCommitId,
         memoryIds: memorySelection.commitMemoryIds,
       }).catch((error) => {
         console.error("memory injection commit failed", error);
@@ -545,7 +642,7 @@ export async function handleChatCompletions(
           enqueueMemoryMaintenanceIfNeeded(env, {
             namespace: auth.profile.namespace,
             conversationId: conversation!.id,
-            fromMessageId: latestUserMessageId!,
+            fromMessageId: latestUserMessageId,
             toMessageId: assistantMessageId,
             source: auth.profile.source
           }),
@@ -603,7 +700,7 @@ export async function handleChatCompletions(
         enqueueMemoryMaintenanceIfNeeded(env, {
           namespace: auth.profile.namespace,
           conversationId: conversation!.id,
-          fromMessageId: latestUserMessageId!,
+          fromMessageId: latestUserMessageId,
           toMessageId: assistantMessageId,
           source: auth.profile.source
         }),

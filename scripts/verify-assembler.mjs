@@ -4670,6 +4670,60 @@ check("tool image: consecutive tool results preserve order and pairing", () => {
   assert.deepStrictEqual(blocks.map((block) => block.content), ["first", "second"]);
 });
 
+check("vision request explicitly disables reasoning and preserves the image part", () => {
+  const imagePart = {
+    type: "image_url",
+    image_url: { url: "data:image/png;base64,iVBORw0KGgo=" },
+  };
+  const request = productionChatCompletions.buildVisionDescriptionRequest(
+    "minimax/minimax-m3",
+    [imagePart]
+  );
+  assert.strictEqual(request.model, "minimax/minimax-m3");
+  assert.deepStrictEqual(request.reasoning, { enabled: false });
+  assert.strictEqual(request.enable_thinking, false);
+  assert.strictEqual(request.stream, false);
+  assert.strictEqual(request.max_tokens, 500);
+  assert.match(request.messages[0].content, /只输出描述本身/);
+  assert.strictEqual(request.messages[1].content[1], imagePart);
+});
+
+check("vision response uses only content, strips thinking blocks, and trims", () => {
+  const response = {
+    choices: [{
+      message: {
+        content: "  <think>internal one</think>\n一只猫坐在窗边。\n<thinking>internal two</thinking>  ",
+        reasoning_content: "must never be used",
+      },
+    }],
+  };
+  assert.strictEqual(
+    productionChatCompletions.extractVisionDescription(response),
+    "一只猫坐在窗边。"
+  );
+});
+
+check("vision response fails closed when content is absent or only thinking", () => {
+  assert.strictEqual(
+    productionChatCompletions.extractVisionDescription({
+      choices: [{ message: { reasoning_content: "reasoning only" } }],
+    }),
+    null
+  );
+  assert.strictEqual(
+    productionChatCompletions.extractVisionDescription({
+      choices: [{ message: { content: " <thinking>reasoning only</thinking> " } }],
+    }),
+    null
+  );
+  assert.strictEqual(
+    productionChatCompletions.extractVisionDescription({
+      choices: [{ message: { content: "<think>unclosed reasoning" } }],
+    }),
+    null
+  );
+});
+
 check("vision split: tool-only image does not select images for the small vision model", () => {
   const messages = [
     { role: "assistant", content: null, tool_calls: [{ id: "toolu_photo" }] },
@@ -4872,7 +4926,7 @@ await checkAsync("24h retention task integrates remote soft lifecycle without ch
 await checkAsync("chat commits only after upstream.ok and explicitly excludes heartbeat", async () => {
   const source = await readFile(new URL("../src/api/chatCompletions.ts", import.meta.url), "utf8");
   const successGuard = source.indexOf("if (!upstream.ok)");
-  const commitGuard = source.indexOf("if (!isHeartbeat && latestUserMessageId && memorySelection.commitMemoryIds.length > 0)");
+  const commitGuard = source.indexOf("if (!isHeartbeat && memoryCommitId && memorySelection.commitMemoryIds.length > 0)");
   const streamBranch = source.indexOf("if (body.stream)", commitGuard);
   assert.ok(successGuard >= 0);
   assert.ok(commitGuard > successGuard, "commit must happen after the upstream success guard");

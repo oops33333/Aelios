@@ -9,6 +9,33 @@ function contentToText(content: OpenAIChatMessage["content"]): string {
   return JSON.stringify(content);
 }
 
+function isUserTurnMessage(message: OpenAIChatMessage): boolean {
+  return message.role === "user" && !(Array.isArray(message.content) && message.content.some(
+    (block) => block != null && typeof block === "object" && "type" in block && block.type === "tool_result"
+  ));
+}
+
+export function isNewUserRequest(messages: OpenAIChatMessage[]): boolean {
+  const lastMessage = [...messages].reverse().find((message) => message.role !== "system");
+  return lastMessage != null && isUserTurnMessage(lastMessage);
+}
+
+export async function findUserMessageForContinuation(
+  db: D1Database,
+  input: { namespace: string; conversationId: string; messages: OpenAIChatMessage[] }
+): Promise<string | undefined> {
+  const lastUserMessage = [...input.messages].reverse().find(isUserTurnMessage);
+  if (!lastUserMessage) return undefined;
+  const matches = await db.prepare(
+    `SELECT id FROM messages
+     WHERE namespace = ? AND conversation_id = ? AND role = 'user' AND content = ?
+     LIMIT 2`
+  ).bind(input.namespace, input.conversationId, contentToText(lastUserMessage.content))
+    .all<{ id: string }>();
+  // 未命中或内容重复而无法唯一确定时，不猜测关联，也不新增用户消息。
+  return matches.results?.length === 1 ? matches.results[0].id : undefined;
+}
+
 export async function saveUserMessages(
   db: D1Database,
   input: {
@@ -22,6 +49,7 @@ export async function saveUserMessages(
     stream: boolean;
   }
 ): Promise<string[]> {
+  if (!isNewUserRequest(input.messages)) return [];
   const lastUserMessage = [...input.messages].reverse().find((message) => message.role === "user");
   const userMessages = lastUserMessage ? [lastUserMessage] : [];
   const ids: string[] = [];
