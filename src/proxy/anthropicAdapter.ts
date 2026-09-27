@@ -404,7 +404,7 @@ function splitDynamicSystemBlocks(
 }
 
 function getMaxTokens(req: OpenAIChatRequest): number {
-  const value = typeof req.max_tokens === "number" ? req.max_tokens : 1024;
+  const value = typeof req.max_tokens === "number" ? req.max_tokens : 2048;
   return Math.max(Math.floor(value), 1);
 }
 
