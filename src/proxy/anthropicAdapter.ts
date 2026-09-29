@@ -646,10 +646,13 @@ function buildThinkingConfig(
 
 function getAnthropicMaxTokens(
   req: OpenAIChatRequest,
-  env: Env,
+  targetModel: string,
   thinking: AnthropicRequest["thinking"] | undefined
 ): number {
-  const maxTokens = getMaxTokens(req);
+  const isOpus55 = /^claude-opus-5-5(?:$|-)/.test(getCanonicalAnthropicModel(targetModel));
+  const maxTokens = isOpus55 && typeof req.max_tokens !== "number"
+    ? 128000
+    : getMaxTokens(req);
   if (!thinking) return maxTokens;
   if (thinking.type !== "enabled") return maxTokens;
   return Math.max(maxTokens, thinking.budget_tokens + Math.min(Math.max(maxTokens, 256), 4096));
@@ -927,7 +930,7 @@ export async function buildAnthropicNativeRequest(
 
   return {
     model: stripAnthropicModelPrefix(input.targetModel),
-    max_tokens: getAnthropicMaxTokens(req, input.env, thinking),
+    max_tokens: getAnthropicMaxTokens(req, input.targetModel, thinking),
     cache_control: buildAutomaticCacheControl(input.env),
     temperature: isOpus5(input.targetModel) || (thinking && thinking.type !== "disabled")
       ? undefined
@@ -978,7 +981,7 @@ export function buildAnthropicRequestFromAssembled(
 
   return {
     model: stripAnthropicModelPrefix(targetModel),
-    max_tokens: getAnthropicMaxTokens(req, env, thinking),
+    max_tokens: getAnthropicMaxTokens(req, targetModel, thinking),
     cache_control: buildAutomaticCacheControl(env),
     temperature: isOpus5(targetModel) || (thinking && thinking.type !== "disabled")
       ? undefined
