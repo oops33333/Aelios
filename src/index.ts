@@ -6,6 +6,7 @@ import { handleChatCompletions } from "./api/chatCompletions";
 import { handleGuideDogChatCompletions } from "./api/guideDog";
 import { handleIngestMessagesApi, handleMemories, handleSearchMemoriesApi } from "./api/memories";
 import { handleMcp } from "./api/mcp";
+import { handleAeliosMemoryMcp } from "./api/aeliosMemoryMcp";
 import { handleModels } from "./api/models";
 import { handleUsage } from "./api/usage";
 import { runDailyMemoryDigest } from "./memory/dailyDigest";
@@ -75,6 +76,10 @@ export default {
       (url.pathname === "/v1/guide-dog/chat/completions" || url.pathname === "/guide-dog/v1/chat/completions")
     ) {
       return handleGuideDogChatCompletions(request, env);
+    }
+
+    if (url.pathname === "/aelios-memory/mcp") {
+      return handleAeliosMemoryMcp(request, env);
     }
 
     if (url.pathname === "/mcp" || url.pathname === "/memory-mcp") {
