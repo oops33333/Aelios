@@ -109,6 +109,9 @@ export async function handleUsage(request: Request, env: Env): Promise<Response>
       gateway_log_id: logId,
       cost: pricing.cost,
       cost_status: pricing.status,
+      cost_reason: pricing.reason ?? null,
+      cost_http_status: pricing.http_status ?? null,
+      cost_error_codes: pricing.error_codes ?? [],
       prompt_total: promptTotal,
       // 命中率 = 缓存读 / (未缓存输入 + 缓存读 + 缓存写)
       cache_hit_rate: promptTotal > 0 ? Math.round((read / promptTotal) * 1000) / 10 : null
