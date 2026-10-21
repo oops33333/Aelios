@@ -284,7 +284,7 @@ export async function handleChatCompletions(
   const requestReceivedAt = Date.now();
 
   if (isHeartbeat) {
-    // 心跳不落库也不该走流式；防止下游 conversation!.id 空指针
+    // 心跳不保存聊天消息，也不走流式；仅记录用量供费用查询。
     body = { ...body, stream: false };
 
     // 用最近一次真实请求的客户端 body 顶替裸 ping，下方走与真实请求完全
@@ -634,6 +634,7 @@ export async function handleChatCompletions(
             provider,
             model: targetModel,
             usage: parsed.usage,
+            gatewayLogId: upstream.headers.get("cf-aig-log-id"),
             cacheMode: anthropicCacheMode,
             cacheTtl: env.ANTHROPIC_CACHE_TTL || "5m",
             clientSystemHash,
@@ -651,10 +652,23 @@ export async function handleChatCompletions(
       );
     }
 
+    if (isHeartbeat) {
+      ctx.waitUntil(saveUsageLog(env.DB, {
+        messageId: null,
+        namespace: auth.profile.namespace,
+        provider,
+        model: targetModel,
+        usage: parsed.usage,
+        gatewayLogId: upstream.headers.get("cf-aig-log-id"),
+        isHeartbeat: true
+      }));
+    }
+
     return new Response(JSON.stringify(parsed.openai), {
       status: 200,
       headers: {
-        "content-type": "application/json; charset=utf-8"
+        "content-type": "application/json; charset=utf-8",
+        "cf-aig-log-id": upstream.headers.get("cf-aig-log-id") || ""
       }
     });
   }
@@ -694,6 +708,7 @@ export async function handleChatCompletions(
           provider,
           model: targetModel,
           usage: parsed.usage,
+          gatewayLogId: upstream.headers.get("cf-aig-log-id"),
           clientSystemHash,
           cacheAnchorBlock
         }),
@@ -709,10 +724,23 @@ export async function handleChatCompletions(
     );
   }
 
+  if (isHeartbeat) {
+    ctx.waitUntil(saveUsageLog(env.DB, {
+      messageId: null,
+      namespace: auth.profile.namespace,
+      provider,
+      model: targetModel,
+      usage: parsed.usage,
+      gatewayLogId: upstream.headers.get("cf-aig-log-id"),
+      isHeartbeat: true
+    }));
+  }
+
   return new Response(JSON.stringify(parsed), {
     status: 200,
     headers: {
-      "content-type": "application/json; charset=utf-8"
+      "content-type": "application/json; charset=utf-8",
+      "cf-aig-log-id": upstream.headers.get("cf-aig-log-id") || ""
     }
   });
 }

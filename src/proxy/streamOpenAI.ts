@@ -11,6 +11,7 @@ import type { Env, KeyProfile, TokenUsage } from "../types";
 import { getSseData, splitSseEvents } from "../utils/sseParser";
 
 interface StreamOpenAIOptions {
+  gatewayLogId?: string | null;
   env: Env;
   ctx: ExecutionContext;
   profile: KeyProfile;
@@ -132,6 +133,7 @@ async function persistStreamResult(options: StreamOpenAIOptions, state: StreamSt
     provider: options.provider,
     model: options.upstreamModel,
     usage: state.usage,
+    gatewayLogId: options.gatewayLogId,
     clientSystemHash: options.clientSystemHash ?? null,
     cacheAnchorBlock: options.cacheAnchorBlock ?? null
   });
@@ -148,6 +150,7 @@ async function persistStreamResult(options: StreamOpenAIOptions, state: StreamSt
 }
 
 export function streamOpenAIWithTee(upstream: Response, options: StreamOpenAIOptions): Response {
+  options = { ...options, gatewayLogId: upstream.headers.get("cf-aig-log-id") };
   if (!upstream.body) {
     return new Response(upstream.body, {
       status: upstream.status,

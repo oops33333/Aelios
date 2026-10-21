@@ -5,11 +5,13 @@ import { nowIso } from "../utils/time";
 export async function saveUsageLog(
   db: D1Database,
   input: {
-    messageId: string;
+    messageId: string | null;
     namespace: string;
     provider: string;
     model: string;
     usage?: TokenUsage;
+    gatewayLogId?: string | null;
+    isHeartbeat?: boolean;
     cacheMode?: string | null;
     cacheTtl?: string | null;
     clientSystemHash?: string | null;
@@ -39,7 +41,11 @@ export async function saveUsageLog(
       input.cacheTtl ?? null,
       input.clientSystemHash ?? null,
       input.cacheAnchorBlock ?? null,
-      JSON.stringify(usage),
+      JSON.stringify({
+        ...usage,
+        cf_aig_log_id: input.gatewayLogId ?? null,
+        cf_aig_kind: input.isHeartbeat ? "heartbeat" : "chat"
+      }),
       nowIso()
     )
     .run();

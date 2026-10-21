@@ -13,6 +13,7 @@ import { getSseData, splitSseEvents } from "../utils/sseParser";
 import { stashThinkingSignature } from "./thinkingStash";
 
 interface StreamAnthropicOptions {
+  gatewayLogId?: string | null;
   env: Env;
   ctx: ExecutionContext;
   profile: KeyProfile;
@@ -201,6 +202,7 @@ async function persistStreamResult(options: StreamAnthropicOptions, state: Strea
     provider: options.provider,
     model: options.upstreamModel,
     usage: state.usage,
+    gatewayLogId: options.gatewayLogId,
     cacheMode: getAnthropicCacheMode(options.env),
     cacheTtl: options.env.ANTHROPIC_CACHE_TTL || "5m",
     clientSystemHash: options.clientSystemHash ?? null,
@@ -219,6 +221,7 @@ async function persistStreamResult(options: StreamAnthropicOptions, state: Strea
 }
 
 export function streamAnthropicToOpenAI(upstream: Response, options: StreamAnthropicOptions): Response {
+  options = { ...options, gatewayLogId: upstream.headers.get("cf-aig-log-id") };
   if (!upstream.body) {
     return new Response(upstream.body, {
       status: upstream.status,
