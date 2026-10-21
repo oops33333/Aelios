@@ -44,7 +44,7 @@ export async function fetchGatewayCost(
     const response = await fetch(url, {
       headers: { authorization: `Bearer ${token}` },
       signal: controller.signal,
-      redirect: "error"
+      redirect: "manual"
     });
     if (response.status === 401 || response.status === 403) {
       return { cost: null, status: "forbidden", http_status: response.status };
