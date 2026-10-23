@@ -115,7 +115,11 @@ export function buildVisionDescriptionRequest(
     // OpenRouter uses reasoning; MiniMax M3's native API uses thinking.type.
     // Keep these scoped to the vision call, with the existing output budget.
     reasoning: { enabled: false, ...(isMiniMaxM3 ? { effort: "none" } : {}) },
-    ...(isMiniMaxM3 ? { thinking: { type: "disabled" } } : {}),
+    ...(isMiniMaxM3 ? {
+      thinking: { type: "disabled" },
+      // Pin the vision call to MiniMax for verification of disabled thinking.
+      provider: { only: ["minimax"], allow_fallbacks: false },
+    } : {}),
     enable_thinking: false,
     stream: false,
   };
