@@ -104,6 +104,7 @@ export function buildVisionDescriptionRequest(
   model: string,
   userImageParts: Record<string, unknown>[]
 ): OpenAIChatRequest {
+  const isMiniMaxM3 = /^(?:minimax\/)?minimax-m3(?:-\d{8})?$/i.test(model);
   return {
     model,
     messages: [
@@ -111,7 +112,10 @@ export function buildVisionDescriptionRequest(
       { role: "user", content: [{ type: "text", text: "请描述这张图片。" }, ...userImageParts] },
     ],
     max_tokens: 500,
-    reasoning: { enabled: false },
+    // OpenRouter uses reasoning; MiniMax M3's native API uses thinking.type.
+    // Keep these scoped to the vision call, with the existing output budget.
+    reasoning: { enabled: false, ...(isMiniMaxM3 ? { effort: "none" } : {}) },
+    ...(isMiniMaxM3 ? { thinking: { type: "disabled" } } : {}),
     enable_thinking: false,
     stream: false,
   };

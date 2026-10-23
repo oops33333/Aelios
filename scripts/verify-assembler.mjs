@@ -4680,12 +4680,57 @@ check("vision request explicitly disables reasoning and preserves the image part
     [imagePart]
   );
   assert.strictEqual(request.model, "minimax/minimax-m3");
-  assert.deepStrictEqual(request.reasoning, { enabled: false });
+  assert.deepStrictEqual(request.reasoning, { enabled: false, effort: "none" });
+  assert.deepStrictEqual(request.thinking, { type: "disabled" });
   assert.strictEqual(request.enable_thinking, false);
   assert.strictEqual(request.stream, false);
   assert.strictEqual(request.max_tokens, 500);
   assert.match(request.messages[0].content, /只输出描述本身/);
   assert.strictEqual(request.messages[1].content[1], imagePart);
+});
+
+check("vision thinking controls target M3 aliases without changing other models", () => {
+  for (const model of ["MiniMax-M3", "minimax/minimax-m3-20260531"]) {
+    const request = productionChatCompletions.buildVisionDescriptionRequest(model, []);
+    assert.deepStrictEqual(request.reasoning, { enabled: false, effort: "none" });
+    assert.deepStrictEqual(request.thinking, { type: "disabled" });
+  }
+  for (const model of ["minimax/minimax-m3.1-flash", "minimax/minimax-m2.7", "other/vision-model"]) {
+    const request = productionChatCompletions.buildVisionDescriptionRequest(model, []);
+    assert.deepStrictEqual(request.reasoning, { enabled: false });
+    assert.strictEqual(request.thinking, undefined);
+  }
+});
+
+await checkAsync("vision controls survive the production OpenRouter transport", async () => {
+  const { callOpenAICompat } = await importBundledProductionModule("../src/proxy/openaiAdapter.ts");
+  const originalFetch = globalThis.fetch;
+  let sentBody;
+  globalThis.fetch = async (url, options) => {
+    assert.strictEqual(new URL(url).hostname, "openrouter.ai");
+    sentBody = JSON.parse(options.body);
+    return new Response(JSON.stringify({ choices: [{ message: { content: "一张测试图片。" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    const request = productionChatCompletions.buildVisionDescriptionRequest("minimax/minimax-m3", [
+      { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
+    ]);
+    const response = await callOpenAICompat({ OPENROUTER_API_KEY: "unit-test-placeholder" }, request);
+    assert.deepStrictEqual(sentBody, request);
+    assert.deepStrictEqual(sentBody.reasoning, { enabled: false, effort: "none" });
+    assert.deepStrictEqual(sentBody.thinking, { type: "disabled" });
+    assert.strictEqual(sentBody.max_tokens, 500);
+    assert.strictEqual(sentBody.reasoning.exclude, undefined, "hiding reasoning is not disabling it");
+    assert.strictEqual(
+      productionChatCompletions.extractVisionDescription(await response.json()),
+      "一张测试图片。"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 check("vision response uses only content, strips thinking blocks, and trims", () => {
