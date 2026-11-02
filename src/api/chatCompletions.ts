@@ -109,11 +109,11 @@ export function buildVisionDescriptionRequest(
     model,
     messages: [
       { role: "system", content: "你是图片描述工具。如实、详细地描述图片中看到的所有内容：物体、人物、场景、文字、颜色、布局。只输出描述本身，不要加任何分析、解读、评论或开场白。" },
-      { role: "user", content: [{ type: "text", text: "请描述这张图片。" }, ...userImageParts] },
+      { role: "user", content: [{ type: "text", text: "请按图片传入顺序逐张描述，每张单独一段，以“图片一描述：”“图片二描述：”等作为段落开头。单张图片也使用“图片一描述：”。" }, ...userImageParts] },
     ],
-    max_tokens: 500,
+    max_tokens: userImageParts.length * 1500,
     // OpenRouter uses reasoning; MiniMax M3's native API uses thinking.type.
-    // Keep these scoped to the vision call, with the existing output budget.
+    // Keep these scoped to the vision call.
     reasoning: { enabled: false, ...(isMiniMaxM3 ? { effort: "none" } : {}) },
     ...(isMiniMaxM3 ? {
       thinking: { type: "disabled" },
@@ -347,7 +347,7 @@ export async function handleChatCompletions(
       messages: stripNonToolVisionImages(body.messages),
     };
     if (visionOutput) {
-      const visionTag = `\n\n<vision_context>\n用户发送了一张图片。以下是图片的描述：\n${visionOutput}\n</vision_context>`;
+      const visionTag = `\n\n<vision_context>\n用户发送了 ${userImageParts.length} 张图片。以下是按顺序逐张给出的描述：\n${visionOutput}\n</vision_context>`;
       const msgs = [...body.messages];
       for (let i = msgs.length - 1; i >= 0; i--) {
         if (msgs[i].role === "user") {

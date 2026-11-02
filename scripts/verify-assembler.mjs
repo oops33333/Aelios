@@ -4685,7 +4685,7 @@ check("vision request explicitly disables reasoning and preserves the image part
   assert.deepStrictEqual(request.provider, { only: ["minimax"], allow_fallbacks: false });
   assert.strictEqual(request.enable_thinking, false);
   assert.strictEqual(request.stream, false);
-  assert.strictEqual(request.max_tokens, 500);
+  assert.strictEqual(request.max_tokens, 1500);
   assert.match(request.messages[0].content, /只输出描述本身/);
   assert.strictEqual(request.messages[1].content[1], imagePart);
 });
@@ -4726,7 +4726,7 @@ await checkAsync("vision controls survive the production OpenRouter transport", 
     assert.deepStrictEqual(sentBody.reasoning, { enabled: false, effort: "none" });
     assert.deepStrictEqual(sentBody.thinking, { type: "disabled" });
     assert.deepStrictEqual(sentBody.provider, { only: ["minimax"], allow_fallbacks: false });
-    assert.strictEqual(sentBody.max_tokens, 500);
+    assert.strictEqual(sentBody.max_tokens, 1500);
     assert.strictEqual(sentBody.reasoning.exclude, undefined, "hiding reasoning is not disabling it");
     assert.strictEqual(
       productionChatCompletions.extractVisionDescription(await response.json()),
