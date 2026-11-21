@@ -19,7 +19,7 @@ CHAT_MODEL = "deepseek/deepseek-v4-pro"
 # 记忆提取/整理用的模型（免费，省钱）
 SUMMARY_MODEL = "deepseek/deepseek-v4-flash:free"
 # 视觉模型
-VISION_MODEL = "minimax/minimax-m3"
+VISION_MODEL = "qwen/qwen3.7-flash"
 
 # ─── 记忆筛选与压缩（走 OpenRouter，便于查看调用日志）───
 MEMORY_FILTER_MODEL = "qwen/qwen3.7-flash"

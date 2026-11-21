@@ -4670,19 +4670,19 @@ check("tool image: consecutive tool results preserve order and pairing", () => {
   assert.deepStrictEqual(blocks.map((block) => block.content), ["first", "second"]);
 });
 
-check("vision request explicitly disables reasoning and preserves the image part", () => {
+check("Qwen3.7 Flash vision request disables reasoning and preserves the image part", () => {
   const imagePart = {
     type: "image_url",
     image_url: { url: "data:image/png;base64,iVBORw0KGgo=" },
   };
   const request = productionChatCompletions.buildVisionDescriptionRequest(
-    "minimax/minimax-m3",
+    "qwen/qwen3.7-flash",
     [imagePart]
   );
-  assert.strictEqual(request.model, "minimax/minimax-m3");
-  assert.deepStrictEqual(request.reasoning, { enabled: false, effort: "none" });
-  assert.deepStrictEqual(request.thinking, { type: "disabled" });
-  assert.deepStrictEqual(request.provider, { only: ["deepinfra"], allow_fallbacks: false });
+  assert.strictEqual(request.model, "qwen/qwen3.7-flash");
+  assert.deepStrictEqual(request.reasoning, { enabled: false });
+  assert.strictEqual(request.thinking, undefined);
+  assert.strictEqual(request.provider, undefined);
   assert.strictEqual(request.enable_thinking, false);
   assert.strictEqual(request.stream, false);
   assert.strictEqual(request.max_tokens, 1500);
@@ -4705,7 +4705,7 @@ check("vision thinking controls target M3 aliases without changing other models"
   }
 });
 
-await checkAsync("vision controls survive the production OpenRouter transport", async () => {
+await checkAsync("Qwen3.7 Flash vision controls survive the production OpenRouter transport", async () => {
   const { callOpenAICompat } = await importBundledProductionModule("../src/proxy/openaiAdapter.ts");
   const originalFetch = globalThis.fetch;
   let sentBody;
@@ -4718,14 +4718,16 @@ await checkAsync("vision controls survive the production OpenRouter transport", 
     });
   };
   try {
-    const request = productionChatCompletions.buildVisionDescriptionRequest("minimax/minimax-m3", [
+    const request = productionChatCompletions.buildVisionDescriptionRequest("qwen/qwen3.7-flash", [
       { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } },
     ]);
     const response = await callOpenAICompat({ OPENROUTER_API_KEY: "unit-test-placeholder" }, request);
     assert.deepStrictEqual(sentBody, request);
-    assert.deepStrictEqual(sentBody.reasoning, { enabled: false, effort: "none" });
-    assert.deepStrictEqual(sentBody.thinking, { type: "disabled" });
-    assert.deepStrictEqual(sentBody.provider, { only: ["deepinfra"], allow_fallbacks: false });
+    assert.strictEqual(sentBody.model, "qwen/qwen3.7-flash");
+    assert.deepStrictEqual(sentBody.reasoning, { enabled: false });
+    assert.strictEqual(sentBody.enable_thinking, false);
+    assert.strictEqual(sentBody.thinking, undefined);
+    assert.strictEqual(sentBody.provider, undefined);
     assert.strictEqual(sentBody.max_tokens, 1500);
     assert.strictEqual(sentBody.reasoning.exclude, undefined, "hiding reasoning is not disabling it");
     assert.strictEqual(
