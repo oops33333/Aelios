@@ -117,8 +117,8 @@ export function buildVisionDescriptionRequest(
     reasoning: { enabled: false, ...(isMiniMaxM3 ? { effort: "none" } : {}) },
     ...(isMiniMaxM3 ? {
       thinking: { type: "disabled" },
-      // Pin the vision call to MiniMax for verification of disabled thinking.
-      provider: { only: ["minimax"], allow_fallbacks: false },
+      // Use DeepInfra shared capacity; MiniMax's official endpoint is BYOK-only.
+      provider: { only: ["deepinfra"], allow_fallbacks: false },
     } : {}),
     enable_thinking: false,
     stream: false,

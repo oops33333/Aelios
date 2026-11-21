@@ -4682,7 +4682,7 @@ check("vision request explicitly disables reasoning and preserves the image part
   assert.strictEqual(request.model, "minimax/minimax-m3");
   assert.deepStrictEqual(request.reasoning, { enabled: false, effort: "none" });
   assert.deepStrictEqual(request.thinking, { type: "disabled" });
-  assert.deepStrictEqual(request.provider, { only: ["minimax"], allow_fallbacks: false });
+  assert.deepStrictEqual(request.provider, { only: ["deepinfra"], allow_fallbacks: false });
   assert.strictEqual(request.enable_thinking, false);
   assert.strictEqual(request.stream, false);
   assert.strictEqual(request.max_tokens, 1500);
@@ -4695,7 +4695,7 @@ check("vision thinking controls target M3 aliases without changing other models"
     const request = productionChatCompletions.buildVisionDescriptionRequest(model, []);
     assert.deepStrictEqual(request.reasoning, { enabled: false, effort: "none" });
     assert.deepStrictEqual(request.thinking, { type: "disabled" });
-    assert.deepStrictEqual(request.provider, { only: ["minimax"], allow_fallbacks: false });
+    assert.deepStrictEqual(request.provider, { only: ["deepinfra"], allow_fallbacks: false });
   }
   for (const model of ["minimax/minimax-m3.1-flash", "minimax/minimax-m2.7", "other/vision-model"]) {
     const request = productionChatCompletions.buildVisionDescriptionRequest(model, []);
@@ -4725,7 +4725,7 @@ await checkAsync("vision controls survive the production OpenRouter transport", 
     assert.deepStrictEqual(sentBody, request);
     assert.deepStrictEqual(sentBody.reasoning, { enabled: false, effort: "none" });
     assert.deepStrictEqual(sentBody.thinking, { type: "disabled" });
-    assert.deepStrictEqual(sentBody.provider, { only: ["minimax"], allow_fallbacks: false });
+    assert.deepStrictEqual(sentBody.provider, { only: ["deepinfra"], allow_fallbacks: false });
     assert.strictEqual(sentBody.max_tokens, 1500);
     assert.strictEqual(sentBody.reasoning.exclude, undefined, "hiding reasoning is not disabling it");
     assert.strictEqual(
